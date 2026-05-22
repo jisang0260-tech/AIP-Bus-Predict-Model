@@ -356,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Analyze only the first N frames after skipping. Useful for quick tests.",
     )
-    parser.add_argument("--start-time", default="04:48:04", type=parse_time_to_seconds)
+    parser.add_argument("--start-time", default="00:00:01", type=parse_time_to_seconds)
     parser.add_argument(
         "--frame-interval-sec",
         default=None,
@@ -454,7 +454,7 @@ def main() -> None:
     if args.max_missing_frames < 0:
         raise ValueError("--max-missing-frames cannot be negative")
 
-    roi = None if args.no_roi else parse_int_tuple(args.roi, 4, "--roi")
+    roi = None
     class_ids = parse_classes(args.classes)
     image_paths, output_csv, frame_interval_sec = resolve_source(args)
     if args.max_frames is not None:
