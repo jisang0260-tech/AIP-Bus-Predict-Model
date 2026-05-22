@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,6 +14,10 @@ from PIL import Image, ImageEnhance, ImageFilter
 
 DEFAULT_ROI = (0, 380, 1400, 700)
 DEFAULT_BUS_CLASSES = (5,)
+DEFAULT_VIDEO_DIR = Path("data/videos")
+DEFAULT_FRAMES_DIR = Path("data/frames")
+DEFAULT_OUTPUT_DIR = Path("outputs")
+VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,121 @@ def collect_images(image_dir: Path, pattern: str, skip_frames: int) -> list[Path
     if skip_frames:
         image_paths = image_paths[skip_frames:]
     return image_paths
+
+
+def safe_stem(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
+    return stem or "video"
+
+
+def discover_video(video_dir: Path) -> Path:
+    if not video_dir.exists():
+        video_dir.mkdir(parents=True, exist_ok=True)
+
+    video_paths = sorted(
+        [
+            path
+            for path in video_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+        ],
+        key=natural_key,
+    )
+
+    if not video_paths:
+        supported = ", ".join(sorted(VIDEO_EXTENSIONS))
+        raise FileNotFoundError(
+            f"No video found in {video_dir}. Put one video there or pass --video. "
+            f"Supported extensions: {supported}"
+        )
+
+    if len(video_paths) > 1:
+        choices = "\n".join(f"  - {path}" for path in video_paths)
+        raise ValueError(
+            "More than one video was found. Choose one with --video:\n" + choices
+        )
+
+    return video_paths[0]
+
+
+def assert_child_path(child: Path, parent: Path) -> None:
+    child_resolved = child.resolve()
+    parent_resolved = parent.resolve()
+    try:
+        child_resolved.relative_to(parent_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Refusing to write outside {parent_resolved}: {child_resolved}") from exc
+
+
+def reset_directory(path: Path, allowed_root: Path) -> None:
+    assert_child_path(path, allowed_root)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def extract_frames_from_video(
+    video_path: Path,
+    output_dir: Path,
+    extract_fps: float,
+    overwrite: bool,
+) -> tuple[int, float]:
+    if extract_fps <= 0:
+        raise ValueError("--extract-fps must be greater than zero")
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit(
+            "opencv-python is required for video input. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    existing_frames = sorted(output_dir.glob("frame_*.jpg"), key=natural_key)
+    if existing_frames and not overwrite:
+        print(f"Using {len(existing_frames)} existing frames from {output_dir}")
+        return len(existing_frames), 1.0 / extract_fps
+
+    reset_directory(output_dir, output_dir.parent)
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
+
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+    if source_fps <= 0:
+        source_fps = extract_fps
+
+    effective_fps = min(extract_fps, source_fps)
+    sample_interval = 1.0 / effective_fps
+    next_sample_time = 0.0
+    frame_index = 0
+    saved_count = 0
+
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+
+        frame_time = frame_index / source_fps
+        if frame_time + (0.5 / source_fps) >= next_sample_time:
+            output_path = output_dir / f"frame_{saved_count:06d}.jpg"
+            encoded_ok, encoded = cv2.imencode(".jpg", frame)
+            if not encoded_ok:
+                raise RuntimeError(f"Could not encode frame {frame_index}")
+            output_path.write_bytes(encoded.tobytes())
+            saved_count += 1
+            next_sample_time += sample_interval
+
+        frame_index += 1
+
+    capture.release()
+
+    if saved_count == 0:
+        raise RuntimeError(f"No frames were extracted from {video_path}")
+
+    print(f"Extracted {saved_count} frames to {output_dir}")
+    return saved_count, sample_interval
 
 
 def preprocess_image(
@@ -190,16 +310,60 @@ def write_csv(rows: list[dict[str, object]], output_csv: Path) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Track buses in frame images with a YOLO x-size model and export "
-            "per-frame CSV features."
+            "Extract video frames, track buses with a YOLO x-size model, "
+            "and export per-frame CSV features."
         )
     )
-    parser.add_argument("--image-dir", required=True, type=Path)
-    parser.add_argument("--output-csv", required=True, type=Path)
-    parser.add_argument("--pattern", default="frame_2_*.jpg")
+    parser.add_argument(
+        "--video",
+        default=None,
+        type=Path,
+        help="Video file to convert into frames before analysis.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        default=DEFAULT_VIDEO_DIR,
+        type=Path,
+        help="Directory used when --video is omitted. Must contain exactly one video.",
+    )
+    parser.add_argument(
+        "--image-dir",
+        default=None,
+        type=Path,
+        help="Use an existing frame image directory instead of a video.",
+    )
+    parser.add_argument(
+        "--frames-dir",
+        default=DEFAULT_FRAMES_DIR,
+        type=Path,
+        help="Directory where extracted video frames are stored.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        type=Path,
+        help="CSV output path. Defaults to outputs/<video_name>_vehicle_counts.csv.",
+    )
+    parser.add_argument("--pattern", default="frame_*.jpg")
     parser.add_argument("--skip-frames", default=0, type=int)
     parser.add_argument("--start-time", default="04:48:04", type=parse_time_to_seconds)
-    parser.add_argument("--frame-interval-sec", default=1.0, type=float)
+    parser.add_argument(
+        "--frame-interval-sec",
+        default=None,
+        type=float,
+        help="Seconds between analyzed frames. Defaults to 1 / --extract-fps for video.",
+    )
+    parser.add_argument(
+        "--extract-fps",
+        default=1.0,
+        type=float,
+        help="Frames per second to extract from video. Default is 1 frame per second.",
+    )
+    parser.add_argument(
+        "--overwrite-frames",
+        action="store_true",
+        help="Re-extract video frames even if the frame folder already exists.",
+    )
     parser.add_argument("--model", default="yolov8x.pt")
     parser.add_argument("--tracker", default="bytetrack.yaml")
     parser.add_argument("--imgsz", default=1280, type=int)
@@ -221,25 +385,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_source(args: argparse.Namespace) -> tuple[list[Path], Path, float]:
+    if args.image_dir is not None:
+        image_paths = collect_images(args.image_dir, args.pattern, args.skip_frames)
+        output_csv = args.output_csv or DEFAULT_OUTPUT_DIR / "vehicle_counts.csv"
+        frame_interval_sec = (
+            args.frame_interval_sec if args.frame_interval_sec is not None else 1.0
+        )
+        return image_paths, output_csv, frame_interval_sec
+
+    video_path = args.video if args.video is not None else discover_video(args.video_dir)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video does not exist: {video_path}")
+
+    video_frame_dir = args.frames_dir / safe_stem(video_path)
+    _, extracted_interval = extract_frames_from_video(
+        video_path=video_path,
+        output_dir=video_frame_dir,
+        extract_fps=args.extract_fps,
+        overwrite=args.overwrite_frames,
+    )
+
+    image_paths = collect_images(video_frame_dir, args.pattern, args.skip_frames)
+    output_csv = (
+        args.output_csv
+        if args.output_csv is not None
+        else DEFAULT_OUTPUT_DIR / f"{safe_stem(video_path)}_vehicle_counts.csv"
+    )
+    frame_interval_sec = (
+        args.frame_interval_sec
+        if args.frame_interval_sec is not None
+        else extracted_interval
+    )
+    return image_paths, output_csv, frame_interval_sec
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
     if args.skip_frames < 0:
         raise ValueError("--skip-frames cannot be negative")
 
-    if args.frame_interval_sec <= 0:
+    if args.frame_interval_sec is not None and args.frame_interval_sec <= 0:
         raise ValueError("--frame-interval-sec must be greater than zero")
+
+    if args.extract_fps <= 0:
+        raise ValueError("--extract-fps must be greater than zero")
 
     if args.max_missing_frames < 0:
         raise ValueError("--max-missing-frames cannot be negative")
 
     roi = None if args.no_roi else parse_int_tuple(args.roi, 4, "--roi")
     class_ids = parse_classes(args.classes)
-    image_paths = collect_images(args.image_dir, args.pattern, args.skip_frames)
+    image_paths, output_csv, frame_interval_sec = resolve_source(args)
 
     if not image_paths:
         raise FileNotFoundError(
-            f"No images found in {args.image_dir} with pattern {args.pattern}"
+            f"No images found with pattern {args.pattern}. Check the video or frame folder."
         )
 
     try:
@@ -261,7 +463,7 @@ def main() -> None:
     last_new_bus_time: float | None = None
 
     for frame_index, image_path in enumerate(image_paths):
-        current_time = args.start_time + frame_index * args.frame_interval_sec
+        current_time = args.start_time + frame_index * frame_interval_sec
         image = preprocess_image(
             image_path=image_path,
             roi=roi,
@@ -325,6 +527,7 @@ def main() -> None:
                 "avg_area": round(avg_area, 3),
                 "avg_area_diff": round(avg_area - previous_avg_area, 3),
                 "max_area": round(max_area, 3),
+                "remaining_time": round(total_waiting_time, 3),
                 "total_waiting_time": round(total_waiting_time, 3),
                 "avg_waiting_time": round(avg_waiting_time, 3),
                 "max_waiting_time": round(max_waiting_time, 3),
@@ -340,8 +543,8 @@ def main() -> None:
         previous_count = summary.count
         previous_avg_area = avg_area
 
-    write_csv(rows, args.output_csv)
-    print(f"Saved {len(rows)} rows to {args.output_csv}")
+    write_csv(rows, output_csv)
+    print(f"Saved {len(rows)} rows to {output_csv}")
 
 
 if __name__ == "__main__":
