@@ -29,22 +29,28 @@ the source video in `data/videos`.
 ## Run From Video
 
 ```powershell
-pip install -r requirements.txt
+.\setup_env.ps1
 
-python .\bus_yolo_analyzer.py
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py
+```
+
+For a quick test before running the full video:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py --max-frames 3
 ```
 
 If there is more than one video, choose one:
 
 ```powershell
-python .\bus_yolo_analyzer.py `
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
   --video ".\data\videos\bus.mp4"
 ```
 
 By default, the script extracts 1 frame per second. To extract more frames:
 
 ```powershell
-python .\bus_yolo_analyzer.py `
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
   --video ".\data\videos\bus.mp4" `
   --extract-fps 2
 ```
@@ -52,7 +58,7 @@ python .\bus_yolo_analyzer.py `
 To force frame extraction again:
 
 ```powershell
-python .\bus_yolo_analyzer.py `
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
   --video ".\data\videos\bus.mp4" `
   --overwrite-frames
 ```
@@ -60,7 +66,7 @@ python .\bus_yolo_analyzer.py `
 ## Run From Existing Frames
 
 ```powershell
-python .\bus_yolo_analyzer.py `
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
   --image-dir ".\data\frames\bus" `
   --output-csv ".\outputs\bus_vehicle_counts.csv"
 ```

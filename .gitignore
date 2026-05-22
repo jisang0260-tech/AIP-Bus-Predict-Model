@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+yolov*.pt
+yolo*.pt
+
+data/videos/*
+!data/videos/.gitkeep
+
+data/frames/*
+!data/frames/.gitkeep
+
+outputs/*
+!outputs/.gitkeep

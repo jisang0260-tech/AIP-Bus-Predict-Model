@@ -155,7 +155,7 @@ def extract_frames_from_video(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     existing_frames = sorted(output_dir.glob("frame_*.jpg"), key=natural_key)
     if existing_frames and not overwrite:
-        print(f"Using {len(existing_frames)} existing frames from {output_dir}")
+        log(f"Using {len(existing_frames)} existing frames from {output_dir}")
         return len(existing_frames), 1.0 / extract_fps
 
     reset_directory(output_dir, output_dir.parent)
@@ -196,7 +196,7 @@ def extract_frames_from_video(
     if saved_count == 0:
         raise RuntimeError(f"No frames were extracted from {video_path}")
 
-    print(f"Extracted {saved_count} frames to {output_dir}")
+    log(f"Extracted {saved_count} frames to {output_dir}")
     return saved_count, sample_interval
 
 
@@ -307,6 +307,10 @@ def write_csv(rows: list[dict[str, object]], output_csv: Path) -> None:
     df.to_csv(output_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -346,6 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pattern", default="frame_*.jpg")
     parser.add_argument("--skip-frames", default=0, type=int)
+    parser.add_argument(
+        "--max-frames",
+        default=None,
+        type=int,
+        help="Analyze only the first N frames after skipping. Useful for quick tests.",
+    )
     parser.add_argument("--start-time", default="04:48:04", type=parse_time_to_seconds)
     parser.add_argument(
         "--frame-interval-sec",
@@ -382,6 +392,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sharpness", default=2.0, type=float)
     parser.add_argument("--median-filter-size", default=3, type=int)
     parser.add_argument("--max-missing-frames", default=10, type=int)
+    parser.add_argument(
+        "--progress-every",
+        default=10,
+        type=int,
+        help="Print progress every N frames.",
+    )
     return parser
 
 
@@ -426,6 +442,9 @@ def main() -> None:
     if args.skip_frames < 0:
         raise ValueError("--skip-frames cannot be negative")
 
+    if args.max_frames is not None and args.max_frames <= 0:
+        raise ValueError("--max-frames must be greater than zero")
+
     if args.frame_interval_sec is not None and args.frame_interval_sec <= 0:
         raise ValueError("--frame-interval-sec must be greater than zero")
 
@@ -438,12 +457,15 @@ def main() -> None:
     roi = None if args.no_roi else parse_int_tuple(args.roi, 4, "--roi")
     class_ids = parse_classes(args.classes)
     image_paths, output_csv, frame_interval_sec = resolve_source(args)
+    if args.max_frames is not None:
+        image_paths = image_paths[: args.max_frames]
 
     if not image_paths:
         raise FileNotFoundError(
             f"No images found with pattern {args.pattern}. Check the video or frame folder."
         )
 
+    log("Loading YOLO/torch. First run can take 1-2 minutes on Windows.")
     try:
         from ultralytics import YOLO
     except ImportError as exc:
@@ -452,7 +474,16 @@ def main() -> None:
             "pip install -r requirements.txt"
         ) from exc
 
+    log(f"Loading model: {args.model}")
     model = YOLO(args.model)
+    log(
+        f"Starting analysis: {len(image_paths)} frames, "
+        f"frame interval {frame_interval_sec:.3f}s, classes {class_ids}"
+    )
+    if args.device is None:
+        log("Device: auto. This PC appears to be CPU-only, so YOLOv8x can be slow.")
+    else:
+        log(f"Device: {args.device}")
 
     rows: list[dict[str, object]] = []
     active_first_seen: dict[int, float] = {}
@@ -462,7 +493,14 @@ def main() -> None:
     previous_avg_area = 0.0
     last_new_bus_time: float | None = None
 
+    total_frames = len(image_paths)
     for frame_index, image_path in enumerate(image_paths):
+        if (
+            args.progress_every > 0
+            and (frame_index == 0 or (frame_index + 1) % args.progress_every == 0)
+        ):
+            log(f"Analyzing frame {frame_index + 1}/{total_frames}: {image_path.name}")
+
         current_time = args.start_time + frame_index * frame_interval_sec
         image = preprocess_image(
             image_path=image_path,
@@ -544,7 +582,7 @@ def main() -> None:
         previous_avg_area = avg_area
 
     write_csv(rows, output_csv)
-    print(f"Saved {len(rows)} rows to {output_csv}")
+    log(f"Saved {len(rows)} rows to {output_csv}")
 
 
 if __name__ == "__main__":
