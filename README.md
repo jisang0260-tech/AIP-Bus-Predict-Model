@@ -71,6 +71,25 @@ To force frame extraction again:
   --output-csv ".\outputs\bus_vehicle_counts.csv"
 ```
 
+## Predict Next Departure
+
+After `bus_yolo_analyzer.py` creates a CSV, run:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_departure_predictor.py
+```
+
+Or choose a CSV directly:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_departure_predictor.py `
+  --csv ".\outputs\bus_vehicle_counts.csv"
+```
+
+The predictor treats `exited_bus_count > 0` as a departure event. If that column
+is missing, it falls back to `bus_count_diff < 0` or tracker ID changes. The
+output is saved as `outputs/<csv_name>_departure_probability.csv`.
+
 ## Main CSV Columns
 
 - `bus_count_inside`: Tracked bus count inside the ROI.
