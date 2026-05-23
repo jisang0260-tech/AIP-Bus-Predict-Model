@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import shutil
 from dataclasses import dataclass
@@ -24,10 +25,31 @@ VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 class DetectionSummary:
     count: int
     ids: list[int]
+    raw_ids: list[int]
     areas: list[float]
     waiting_times: list[float]
     new_ids: list[int]
     exited_ids: list[int]
+    recovered_ids: list[int]
+    raw_id_switches: int
+
+
+@dataclass(frozen=True)
+class TrackObservation:
+    raw_id: int | None
+    box: tuple[float, float, float, float]
+    area: float
+    center_x: float
+    center_y: float
+
+
+@dataclass
+class LogicalTrack:
+    logical_id: int
+    first_seen_time: float
+    last_seen_frame: int
+    last_box: tuple[float, float, float, float]
+    raw_ids: set[int]
 
 
 def parse_time_to_seconds(value: str) -> int:
@@ -249,55 +271,218 @@ def get_track_id(box) -> int | None:
     return int(track_tensor.reshape(-1)[0].item())
 
 
+def get_observations(result) -> list[TrackObservation]:
+    observations: list[TrackObservation] = []
+    for box in iter_boxes(result):
+        x1, y1, x2, y2 = (
+            float(value.item()) for value in box.xyxy[0]
+        )
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        area = width * height
+        observations.append(
+            TrackObservation(
+                raw_id=get_track_id(box),
+                box=(x1, y1, x2, y2),
+                area=area,
+                center_x=x1 + width / 2.0,
+                center_y=y1 + height / 2.0,
+            )
+        )
+    return observations
+
+
+def box_area(box: tuple[float, float, float, float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def box_iou(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    left_x1, left_y1, left_x2, left_y2 = left
+    right_x1, right_y1, right_x2, right_y2 = right
+
+    inter_x1 = max(left_x1, right_x1)
+    inter_y1 = max(left_y1, right_y1)
+    inter_x2 = min(left_x2, right_x2)
+    inter_y2 = min(left_y2, right_y2)
+
+    inter_area = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
+    union_area = box_area(left) + box_area(right) - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def geometric_match_score(
+    observation: TrackObservation,
+    track: LogicalTrack,
+    iou_threshold: float,
+    center_threshold: float,
+) -> float | None:
+    iou = box_iou(observation.box, track.last_box)
+    if iou >= iou_threshold:
+        return 2.0 + iou
+
+    track_area = box_area(track.last_box)
+    area_ratio = min(observation.area, track_area) / max(observation.area, track_area, 1.0)
+    obs_center = (observation.center_x, observation.center_y)
+    track_center = box_center(track.last_box)
+    distance = math.dist(obs_center, track_center)
+    base_size = max(math.sqrt(max(observation.area, track_area, 1.0)), 1.0)
+    normalized_distance = distance / base_size
+
+    if normalized_distance <= center_threshold and area_ratio >= 0.45:
+        return 1.0 - normalized_distance
+
+    return None
+
+
 def summarize_detections(
     result,
     current_time: float,
-    active_first_seen: dict[int, float],
-    active_last_seen_frame: dict[int, int],
-    previous_ids: set[int],
+    logical_tracks: dict[int, LogicalTrack],
+    raw_to_logical: dict[int, int],
+    next_logical_id: int,
     frame_index: int,
     max_missing_frames: int,
-) -> DetectionSummary:
-    current_ids: set[int] = set()
-    areas: list[float] = []
-    waiting_times: list[float] = []
+    stitch_iou_threshold: float,
+    stitch_center_threshold: float,
+) -> tuple[DetectionSummary, int]:
+    observations = get_observations(result)
+    assigned_tracks: set[int] = set()
+    assigned_observations: set[int] = set()
     new_ids: list[int] = []
+    recovered_ids: list[int] = []
+    raw_id_switches = 0
 
-    for box in iter_boxes(result):
-        track_id = get_track_id(box)
-        if track_id is None:
+    def assign_observation(
+        observation: TrackObservation,
+        logical_id: int,
+    ) -> None:
+        nonlocal raw_id_switches
+        track = logical_tracks[logical_id]
+        if frame_index - track.last_seen_frame > 1:
+            recovered_ids.append(logical_id)
+
+        if observation.raw_id is not None:
+            if track.raw_ids and observation.raw_id not in track.raw_ids:
+                raw_id_switches += 1
+            track.raw_ids.add(observation.raw_id)
+            raw_to_logical[observation.raw_id] = logical_id
+
+        track.last_seen_frame = frame_index
+        track.last_box = observation.box
+        assigned_tracks.add(logical_id)
+
+    for observation_index, observation in enumerate(observations):
+        if observation.raw_id is None or observation.raw_id not in raw_to_logical:
             continue
 
-        x1, y1, x2, y2 = box.xyxy[0]
-        area = float(((x2 - x1) * (y2 - y1)).item())
+        logical_id = raw_to_logical[observation.raw_id]
+        track = logical_tracks.get(logical_id)
+        if track is None or logical_id in assigned_tracks:
+            continue
 
-        if track_id not in active_first_seen:
-            active_first_seen[track_id] = current_time
-            new_ids.append(track_id)
+        if frame_index - track.last_seen_frame <= max_missing_frames:
+            assign_observation(observation, logical_id)
+            assigned_observations.add(observation_index)
 
-        active_last_seen_frame[track_id] = frame_index
-        current_ids.add(track_id)
-        areas.append(area)
-        waiting_times.append(current_time - active_first_seen[track_id])
+    for observation_index, observation in enumerate(observations):
+        if observation_index in assigned_observations:
+            continue
 
-    exited_ids = sorted(previous_ids - current_ids)
+        best_logical_id: int | None = None
+        best_score: float | None = None
+        for logical_id, track in logical_tracks.items():
+            if logical_id in assigned_tracks:
+                continue
 
-    stale_ids = [
-        track_id
-        for track_id, last_seen in active_last_seen_frame.items()
-        if frame_index - last_seen > max_missing_frames
+            if frame_index - track.last_seen_frame > max_missing_frames:
+                continue
+
+            score = geometric_match_score(
+                observation=observation,
+                track=track,
+                iou_threshold=stitch_iou_threshold,
+                center_threshold=stitch_center_threshold,
+            )
+            if score is None:
+                continue
+
+            if best_score is None or score > best_score:
+                best_score = score
+                best_logical_id = logical_id
+
+        if best_logical_id is not None:
+            assign_observation(observation, best_logical_id)
+            assigned_observations.add(observation_index)
+            continue
+
+        logical_id = next_logical_id
+        next_logical_id += 1
+        raw_ids = {observation.raw_id} if observation.raw_id is not None else set()
+        logical_tracks[logical_id] = LogicalTrack(
+            logical_id=logical_id,
+            first_seen_time=current_time,
+            last_seen_frame=frame_index,
+            last_box=observation.box,
+            raw_ids=raw_ids,
+        )
+        if observation.raw_id is not None:
+            raw_to_logical[observation.raw_id] = logical_id
+        assigned_tracks.add(logical_id)
+        assigned_observations.add(observation_index)
+        new_ids.append(logical_id)
+
+    stale_ids = sorted(
+        logical_id
+        for logical_id, track in logical_tracks.items()
+        if frame_index - track.last_seen_frame > max_missing_frames
+    )
+    for logical_id in stale_ids:
+        track = logical_tracks.pop(logical_id)
+        for raw_id in track.raw_ids:
+            if raw_to_logical.get(raw_id) == logical_id:
+                raw_to_logical.pop(raw_id, None)
+
+    active_tracks = [
+        track
+        for track in logical_tracks.values()
+        if frame_index - track.last_seen_frame <= max_missing_frames
     ]
-    for track_id in stale_ids:
-        active_first_seen.pop(track_id, None)
-        active_last_seen_frame.pop(track_id, None)
+    active_tracks = sorted(active_tracks, key=lambda track: track.logical_id)
+    areas = [box_area(track.last_box) for track in active_tracks]
+    waiting_times = [
+        current_time - track.first_seen_time
+        for track in active_tracks
+    ]
+    raw_ids = sorted(
+        observation.raw_id
+        for observation in observations
+        if observation.raw_id is not None
+    )
 
-    return DetectionSummary(
-        count=len(current_ids),
-        ids=sorted(current_ids),
-        areas=areas,
-        waiting_times=waiting_times,
-        new_ids=sorted(new_ids),
-        exited_ids=exited_ids,
+    return (
+        DetectionSummary(
+            count=len(active_tracks),
+            ids=[track.logical_id for track in active_tracks],
+            raw_ids=raw_ids,
+            areas=areas,
+            waiting_times=waiting_times,
+            new_ids=sorted(new_ids),
+            exited_ids=stale_ids,
+            recovered_ids=sorted(set(recovered_ids)),
+            raw_id_switches=raw_id_switches,
+        ),
+        next_logical_id,
     )
 
 
@@ -375,9 +560,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-extract video frames even if the frame folder already exists.",
     )
     parser.add_argument("--model", default="yolov8x.pt")
-    parser.add_argument("--tracker", default="bytetrack.yaml")
+    parser.add_argument("--tracker", default="trackers/bus_botsort.yaml")
     parser.add_argument("--imgsz", default=1280, type=int)
-    parser.add_argument("--conf", default=0.12, type=float)
+    parser.add_argument("--conf", default=0.25, type=float)
     parser.add_argument("--iou", default=0.6, type=float)
     parser.add_argument(
         "--classes",
@@ -391,7 +576,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contrast", default=1.5, type=float)
     parser.add_argument("--sharpness", default=2.0, type=float)
     parser.add_argument("--median-filter-size", default=3, type=int)
-    parser.add_argument("--max-missing-frames", default=10, type=int)
+    parser.add_argument(
+        "--max-missing-frames",
+        default=30,
+        type=int,
+        help="Keep a logical bus ID alive for this many missed frames.",
+    )
+    parser.add_argument(
+        "--stitch-iou-threshold",
+        default=0.25,
+        type=float,
+        help="Reconnect a changed tracker ID when box IoU is at least this value.",
+    )
+    parser.add_argument(
+        "--stitch-center-threshold",
+        default=0.35,
+        type=float,
+        help="Reconnect a changed tracker ID when normalized center movement is small.",
+    )
     parser.add_argument(
         "--progress-every",
         default=10,
@@ -454,7 +656,13 @@ def main() -> None:
     if args.max_missing_frames < 0:
         raise ValueError("--max-missing-frames cannot be negative")
 
-    roi = None
+    if not 0 <= args.stitch_iou_threshold <= 1:
+        raise ValueError("--stitch-iou-threshold must be between 0 and 1")
+
+    if args.stitch_center_threshold < 0:
+        raise ValueError("--stitch-center-threshold cannot be negative")
+
+    roi = None if args.no_roi else parse_int_tuple(args.roi, 4, "--roi")
     class_ids = parse_classes(args.classes)
     image_paths, output_csv, frame_interval_sec = resolve_source(args)
     if args.max_frames is not None:
@@ -486,9 +694,9 @@ def main() -> None:
         log(f"Device: {args.device}")
 
     rows: list[dict[str, object]] = []
-    active_first_seen: dict[int, float] = {}
-    active_last_seen_frame: dict[int, int] = {}
-    previous_ids: set[int] = set()
+    logical_tracks: dict[int, LogicalTrack] = {}
+    raw_to_logical: dict[int, int] = {}
+    next_logical_id = 1
     previous_count = 0
     previous_avg_area = 0.0
     last_new_bus_time: float | None = None
@@ -523,14 +731,16 @@ def main() -> None:
             verbose=False,
         )
 
-        summary = summarize_detections(
+        summary, next_logical_id = summarize_detections(
             result=results[0],
             current_time=current_time,
-            active_first_seen=active_first_seen,
-            active_last_seen_frame=active_last_seen_frame,
-            previous_ids=previous_ids,
+            logical_tracks=logical_tracks,
+            raw_to_logical=raw_to_logical,
+            next_logical_id=next_logical_id,
             frame_index=frame_index,
             max_missing_frames=args.max_missing_frames,
+            stitch_iou_threshold=args.stitch_iou_threshold,
+            stitch_center_threshold=args.stitch_center_threshold,
         )
 
         if summary.new_ids:
@@ -558,10 +768,14 @@ def main() -> None:
                 "bus_count_inside": summary.count,
                 "bus_count_diff": summary.count - previous_count,
                 "bus_ids_inside": ";".join(str(track_id) for track_id in summary.ids),
+                "raw_tracker_ids_inside": ";".join(str(track_id) for track_id in summary.raw_ids),
                 "new_bus_count": len(summary.new_ids),
                 "new_bus_ids": ";".join(str(track_id) for track_id in summary.new_ids),
                 "exited_bus_count": len(summary.exited_ids),
                 "exited_bus_ids": ";".join(str(track_id) for track_id in summary.exited_ids),
+                "recovered_bus_count": len(summary.recovered_ids),
+                "recovered_bus_ids": ";".join(str(track_id) for track_id in summary.recovered_ids),
+                "raw_id_switch_count": summary.raw_id_switches,
                 "avg_area": round(avg_area, 3),
                 "avg_area_diff": round(avg_area - previous_avg_area, 3),
                 "max_area": round(max_area, 3),
@@ -577,7 +791,6 @@ def main() -> None:
             }
         )
 
-        previous_ids = set(summary.ids)
         previous_count = summary.count
         previous_avg_area = avg_area
 

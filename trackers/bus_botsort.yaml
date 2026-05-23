@@ -1,0 +1,23 @@
+# Stable bus tracking defaults for a fixed CCTV-style camera.
+tracker_type: botsort
+
+# Use cleaner detections to avoid creating short-lived IDs.
+track_high_thresh: 0.35
+track_low_thresh: 0.12
+new_track_thresh: 0.35
+
+# Keep lost tracks alive longer so a bus can survive brief YOLO misses.
+track_buffer: 90
+
+# Slightly stricter association for crowded bus depots.
+match_thresh: 0.85
+fuse_score: True
+
+# The camera is fixed, so global motion compensation is unnecessary.
+gmc_method: none
+
+# ReID helps in some cases but is slow on CPU and can require extra model support.
+with_reid: False
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+model: auto

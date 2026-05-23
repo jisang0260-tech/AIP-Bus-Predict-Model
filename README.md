@@ -71,6 +71,25 @@ To force frame extraction again:
   --output-csv ".\outputs\bus_vehicle_counts.csv"
 ```
 
+## Tracker Stability
+
+The analyzer now uses `trackers/bus_botsort.yaml` by default and adds a logical
+ID layer on top of YOLO's raw tracker IDs. If YOLO briefly misses a bus or gives
+the same bus a new raw ID, the script reconnects it using bounding-box overlap
+and center-position similarity.
+
+Useful tuning options:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
+  --max-missing-frames 45 `
+  --stitch-iou-threshold 0.2 `
+  --stitch-center-threshold 0.45
+```
+
+For this fixed camera, keep `--roi` hardcoded to the same exit/driveway area.
+Use `--no-roi` only when you intentionally want to analyze the full frame.
+
 ## Predict Next Departure
 
 After `bus_yolo_analyzer.py` creates a CSV, run:
@@ -93,7 +112,10 @@ output is saved as `outputs/<csv_name>_departure_probability.csv`.
 ## Main CSV Columns
 
 - `bus_count_inside`: Tracked bus count inside the ROI.
-- `bus_ids_inside`: Current tracker IDs.
+- `bus_ids_inside`: Stable logical tracker IDs.
+- `raw_tracker_ids_inside`: Raw YOLO tracker IDs observed on the current frame.
+- `raw_id_switch_count`: Raw ID changes that were reconnected to an existing logical ID.
+- `recovered_bus_count`: Logical IDs recovered after being missed for one or more frames.
 - `remaining_time`: Same value as `total_waiting_time`, kept for the next model.
 - `total_waiting_time`: Sum of waiting time for buses currently inside the ROI.
 - `avg_waiting_time`: Average waiting time for buses currently inside the ROI.
