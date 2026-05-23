@@ -11,10 +11,15 @@ import pandas as pd
 
 
 DEFAULT_OUTPUT_DIR = Path("outputs")
+DEFAULT_MODEL_PATH = Path("models/departure_random_forest.joblib")
 DEFAULT_BINS = "0-30,30-60,60-120,120-180,180-300,300-600"
 FEATURE_COLUMNS = (
     "bus_count_inside",
     "bus_count_diff",
+    "new_bus_count",
+    "exited_bus_count",
+    "recovered_bus_count",
+    "raw_id_switch_count",
     "total_waiting_time",
     "avg_waiting_time",
     "max_waiting_time",
@@ -103,15 +108,29 @@ def parse_probability_bins(value: str) -> list[ProbabilityBucket]:
 
 
 def find_latest_csv(output_dir: Path) -> Path:
+    all_csvs = sorted(output_dir.glob("*.csv"))
     candidates = [
         path
-        for path in output_dir.glob("*.csv")
+        for path in all_csvs
         if "departure_probability" not in path.name.lower()
     ]
     if not candidates:
+        probability_outputs = [
+            path.name
+            for path in all_csvs
+            if "departure_probability" in path.name.lower()
+        ]
+        detail = ""
+        if probability_outputs:
+            detail = (
+                " Found only prediction-output CSV files, not YOLO feature CSV files: "
+                + ", ".join(probability_outputs)
+                + "."
+            )
         raise FileNotFoundError(
             f"No CSV found in {output_dir}. Run bus_yolo_analyzer.py first "
             "or pass --csv explicitly."
+            f"{detail}"
         )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
@@ -416,6 +435,82 @@ def predict_departure(
     )
 
 
+def load_model_bundle(model_path: Path) -> dict[str, object]:
+    try:
+        import joblib
+    except ImportError as exc:
+        raise SystemExit(
+            "joblib/scikit-learn are required for model prediction. "
+            "Install dependencies with: pip install -r requirements.txt"
+        ) from exc
+
+    bundle = joblib.load(model_path)
+    required = {"regressor", "classifier", "feature_columns", "bins"}
+    missing = required - set(bundle)
+    if missing:
+        raise ValueError(f"Model bundle is missing keys: {sorted(missing)}")
+    return bundle
+
+
+def model_feature_frame(df: pd.DataFrame, row_index: int, feature_columns: list[str]) -> pd.DataFrame:
+    features = df.copy()
+    for column in feature_columns:
+        coerce_numeric(features, column, 0.0)
+    return features.loc[[row_index], feature_columns]
+
+
+def predict_departure_with_model(
+    df: pd.DataFrame,
+    row_index: int,
+    bundle: dict[str, object],
+) -> Prediction:
+    feature_columns = list(bundle["feature_columns"])
+    buckets = parse_probability_bins(str(bundle["bins"]))
+    x_current = model_feature_frame(df, row_index, feature_columns)
+
+    regressor = bundle["regressor"]
+    classifier = bundle["classifier"]
+    predicted_seconds = max(0.0, float(regressor.predict(x_current)[0]))
+
+    classifier_proba = classifier.predict_proba(x_current)[0]
+    classifier_model = getattr(classifier, "named_steps", {}).get("model", classifier)
+    classes = [str(value) for value in classifier_model.classes_]
+    probability_by_label = {
+        label: float(probability)
+        for label, probability in zip(classes, classifier_proba)
+    }
+
+    current_time = float(df.loc[row_index, "time_second"])
+    predicted_eta = current_time + predicted_seconds
+    rows = []
+    for bucket in buckets:
+        probability = probability_by_label.get(bucket.label, 0.0)
+        eta_start = current_time + bucket.start_sec
+        eta_end = current_time + bucket.end_sec if bucket.end_sec is not None else None
+        rows.append(
+            {
+                "bucket": bucket.label,
+                "start_sec": bucket.start_sec,
+                "end_sec": "" if bucket.end_sec is None else bucket.end_sec,
+                "probability": round(probability, 6),
+                "probability_percent": round(probability * 100, 2),
+                "eta_start_hhmmss": seconds_to_hhmmss(eta_start),
+                "eta_end_hhmmss": "" if eta_end is None else seconds_to_hhmmss(eta_end),
+                "regressor_predicted_departure_in_sec": round(predicted_seconds, 3),
+                "regressor_predicted_departure_hhmmss": seconds_to_hhmmss(predicted_eta),
+                "prediction_method": "random_forest_model",
+            }
+        )
+
+    return Prediction(
+        method="random_forest_model",
+        row_index=row_index,
+        current_time_second=current_time,
+        expected_departure_in_sec=predicted_seconds,
+        buckets=rows,
+    )
+
+
 def write_prediction(prediction: Prediction, output_csv: Path) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(prediction.buckets).to_csv(
@@ -445,6 +540,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="CSV row to predict from. Default is the latest row.",
     )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_PATH,
+        type=Path,
+        help="Trained RandomForest model bundle. Used automatically when it exists.",
+    )
+    parser.add_argument(
+        "--no-model",
+        action="store_true",
+        help="Ignore trained model and use the old CSV-history fallback.",
+    )
     parser.add_argument("--bins", default=DEFAULT_BINS, type=parse_probability_bins)
     parser.add_argument("--min-samples", default=12, type=int)
     parser.add_argument("--neighbors", default=40, type=int)
@@ -469,6 +575,11 @@ def main() -> None:
     raw_df = pd.read_csv(input_csv)
     if raw_df.empty:
         raise ValueError(f"CSV is empty: {input_csv}")
+    if "probability" in raw_df.columns and "bus_count_inside" not in raw_df.columns:
+        raise ValueError(
+            f"{input_csv} looks like a departure probability output CSV. "
+            "Use the YOLO feature CSV from bus_yolo_analyzer.py instead."
+        )
 
     df = add_departure_targets(normalize_schema(raw_df))
 
@@ -484,14 +595,22 @@ def main() -> None:
         else DEFAULT_OUTPUT_DIR / f"{input_csv.stem}_departure_probability.csv"
     )
 
-    prediction = predict_departure(
-        df=df,
-        row_index=row_index,
-        buckets=args.bins,
-        min_samples=args.min_samples,
-        neighbors=args.neighbors,
-        default_interval_sec=args.default_interval_sec,
-    )
+    if not args.no_model and args.model.exists():
+        bundle = load_model_bundle(args.model)
+        prediction = predict_departure_with_model(
+            df=df,
+            row_index=row_index,
+            bundle=bundle,
+        )
+    else:
+        prediction = predict_departure(
+            df=df,
+            row_index=row_index,
+            buckets=args.bins,
+            min_samples=args.min_samples,
+            neighbors=args.neighbors,
+            default_interval_sec=args.default_interval_sec,
+        )
     write_prediction(prediction, output_csv)
 
     best_bucket = max(prediction.buckets, key=lambda row: float(row["probability"]))
@@ -501,12 +620,14 @@ def main() -> None:
     log(f"Input CSV: {input_csv}")
     log(f"Rows: {len(df)}, detected departure events: {event_count}")
     log(f"Method: {prediction.method}")
+    if prediction.method == "random_forest_model":
+        log(f"Model: {args.model}")
     log(
         "Most likely departure window: "
         f"{best_bucket['bucket']} ({best_bucket['probability_percent']}%)"
     )
     log(
-        "Expected departure: "
+        "Predicted departure: "
         f"in {prediction.expected_departure_in_sec:.1f}s "
         f"around {seconds_to_hhmmss(expected_eta)}"
     )

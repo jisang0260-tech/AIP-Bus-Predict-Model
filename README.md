@@ -93,7 +93,48 @@ is analyzed.
 
 ## Predict Next Departure
 
-After `bus_yolo_analyzer.py` creates a CSV, run:
+## Manual Label Training
+
+Create a manual departure label CSV after watching the video:
+
+```csv
+event_id,event_time_hhmmss,note
+1,00:01:35,left exit
+2,00:03:30,left exit
+3,00:06:28,left exit
+```
+
+Save it under `data/labels`, for example:
+
+```text
+data/labels/20260520_145353_1_departures.csv
+```
+
+Build a training CSV by combining YOLO features with your manual labels:
+
+```powershell
+.\.venv\Scripts\python.exe .\build_training_labels.py `
+  --features ".\outputs\20260520_145353_1_vehicle_counts.csv" `
+  --labels ".\data\labels\20260520_145353_1_departures.csv" `
+  --output ".\outputs\training\20260520_145353_1_training.csv"
+```
+
+Train both RandomForest models:
+
+```powershell
+.\.venv\Scripts\python.exe .\train_departure_model.py `
+  --training-dir ".\outputs\training" `
+  --model-output ".\models\departure_random_forest.joblib"
+```
+
+The model bundle contains:
+
+- `RandomForestRegressor`: predicts how many seconds remain until departure.
+- `RandomForestClassifier`: predicts probability by time bucket.
+
+## Predict Next Departure
+
+After `bus_yolo_analyzer.py` creates a CSV and the RandomForest model is trained, run:
 
 ```powershell
 .\.venv\Scripts\python.exe .\bus_departure_predictor.py
@@ -103,12 +144,13 @@ Or choose a CSV directly:
 
 ```powershell
 .\.venv\Scripts\python.exe .\bus_departure_predictor.py `
-  --csv ".\outputs\bus_vehicle_counts.csv"
+  --csv ".\outputs\bus_vehicle_counts.csv" `
+  --model ".\models\departure_random_forest.joblib"
 ```
 
-The predictor treats `exited_bus_count > 0` as a departure event. If that column
-is missing, it falls back to `bus_count_diff < 0` or tracker ID changes. The
-output is saved as `outputs/<csv_name>_departure_probability.csv`.
+The output includes the regressor's predicted seconds and the classifier's
+bucket probabilities. If no trained model exists, the predictor falls back to
+the older CSV-history method.
 
 ## Main CSV Columns
 
