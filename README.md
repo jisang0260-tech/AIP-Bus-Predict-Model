@@ -87,8 +87,9 @@ Useful tuning options:
   --stitch-center-threshold 0.45
 ```
 
-For this fixed camera, keep `--roi` hardcoded to the same exit/driveway area.
-Use `--no-roi` only when you intentionally want to analyze the full frame.
+For this fixed camera, set `--roi x1,y1,x2,y2` to the same exit/driveway area
+after you confirm the correct coordinates. If `--roi` is omitted, the full frame
+is analyzed.
 
 ## Predict Next Departure
 

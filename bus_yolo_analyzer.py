@@ -570,7 +570,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="COCO class IDs to track. Bus is 5. Use 5,7 if buses are often read as trucks.",
     )
     parser.add_argument("--device", default=None)
-    parser.add_argument("--roi", default=",".join(str(value) for value in DEFAULT_ROI))
+    parser.add_argument(
+        "--roi",
+        default=None,
+        help=(
+            "Optional x1,y1,x2,y2 crop. For a fixed camera, set this to the "
+            "exit/driveway area once it is confirmed."
+        ),
+    )
     parser.add_argument("--no-roi", action="store_true")
     parser.add_argument("--scale", default=1.2, type=float)
     parser.add_argument("--contrast", default=1.5, type=float)
@@ -662,7 +669,7 @@ def main() -> None:
     if args.stitch_center_threshold < 0:
         raise ValueError("--stitch-center-threshold cannot be negative")
 
-    roi = None if args.no_roi else parse_int_tuple(args.roi, 4, "--roi")
+    roi = None if args.no_roi or args.roi is None else parse_int_tuple(args.roi, 4, "--roi")
     class_ids = parse_classes(args.classes)
     image_paths, output_csv, frame_interval_sec = resolve_source(args)
     if args.max_frames is not None:
