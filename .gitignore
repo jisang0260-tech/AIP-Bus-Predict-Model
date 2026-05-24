@@ -15,7 +15,14 @@ data/frames/*
 outputs/*
 !outputs/.gitkeep
 !outputs/training/
+outputs/training/*
 !outputs/training/.gitkeep
 
 models/*.joblib
+models/*.json
 !models/.gitkeep
+
+data/labels/*.csv
+!data/labels/.gitkeep
+
+runs/
