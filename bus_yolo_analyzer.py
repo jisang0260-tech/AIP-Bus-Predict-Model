@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import re
 import shutil
@@ -18,6 +19,7 @@ DEFAULT_BUS_CLASSES = (5,)
 DEFAULT_VIDEO_DIR = Path("data/videos")
 DEFAULT_FRAMES_DIR = Path("data/frames")
 DEFAULT_OUTPUT_DIR = Path("outputs")
+DEFAULT_GATE_CONFIG = Path("configs/gate_rois.json")
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
 
@@ -50,6 +52,13 @@ class LogicalTrack:
     last_seen_frame: int
     last_box: tuple[float, float, float, float]
     raw_ids: set[int]
+
+
+@dataclass(frozen=True)
+class GateRoi:
+    name: str
+    roi: tuple[int, int, int, int]
+    out_direction: tuple[float, float]
 
 
 def parse_time_to_seconds(value: str) -> int:
@@ -155,6 +164,317 @@ def reset_directory(path: Path, allowed_root: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_direction(dx: float, dy: float) -> tuple[float, float]:
+    length = math.hypot(dx, dy)
+    if length <= 0:
+        raise ValueError("Gate out direction cannot be zero length")
+    return dx / length, dy / length
+
+
+def clamp_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:
+    return max(0, min(width - 1, x)), max(0, min(height - 1, y))
+
+
+def normalize_roi(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1 = clamp_point(start[0], start[1], width, height)
+    x2, y2 = clamp_point(end[0], end[1], width, height)
+    left, right = sorted((x1, x2))
+    top, bottom = sorted((y1, y2))
+    if right - left < 5 or bottom - top < 5:
+        raise ValueError("Gate ROI is too small")
+    return left, top, right, bottom
+
+
+def load_gate_config(config_path: Path | None) -> list[GateRoi]:
+    if config_path is None or not config_path.exists():
+        return []
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    gates_data = data.get("gates", [])
+    if not isinstance(gates_data, list):
+        raise ValueError(f"Invalid gate config: {config_path}")
+
+    gates: list[GateRoi] = []
+    for index, item in enumerate(gates_data, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid gate entry #{index} in {config_path}")
+
+        roi = item.get("roi")
+        direction = item.get("out_direction")
+        if not isinstance(roi, list) or len(roi) != 4:
+            raise ValueError(f"Invalid roi for gate #{index} in {config_path}")
+        if not isinstance(direction, list) or len(direction) != 2:
+            raise ValueError(f"Invalid out_direction for gate #{index} in {config_path}")
+
+        dx, dy = normalize_direction(float(direction[0]), float(direction[1]))
+        gates.append(
+            GateRoi(
+                name=str(item.get("name") or f"gate_{index}"),
+                roi=tuple(int(value) for value in roi),
+                out_direction=(dx, dy),
+            )
+        )
+
+    return gates
+
+
+def draw_gate_overlay(image, gates: list[GateRoi], scale: float = 1.0):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit(
+            "opencv-python is required for gate configuration. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    for index, gate in enumerate(gates, start=1):
+        x1, y1, x2, y2 = (int(round(value * scale)) for value in gate.roi)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 210, 255), 2)
+
+        cx = int(round((gate.roi[0] + gate.roi[2]) * 0.5 * scale))
+        cy = int(round((gate.roi[1] + gate.roi[3]) * 0.5 * scale))
+        arrow_len = max(35, int(round(max(x2 - x1, y2 - y1) * 0.35)))
+        dx, dy = gate.out_direction
+        end = (
+            int(round(cx + dx * arrow_len)),
+            int(round(cy + dy * arrow_len)),
+        )
+        cv2.arrowedLine(image, (cx, cy), end, (0, 0, 255), 3, tipLength=0.25)
+        cv2.putText(
+            image,
+            f"{index}: {gate.name} OUT",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 210, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return image
+
+
+def write_gate_config(
+    config_path: Path,
+    preview_path: Path,
+    image_path: Path,
+    image_size: tuple[int, int],
+    gates: list[GateRoi],
+) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "coordinate_space": "original_frame",
+        "source_frame": str(image_path),
+        "preview_frame": str(preview_path),
+        "image_width": image_size[0],
+        "image_height": image_size[1],
+        "gates": [
+            {
+                "name": gate.name,
+                "roi": list(gate.roi),
+                "out_direction": [
+                    round(gate.out_direction[0], 6),
+                    round(gate.out_direction[1], 6),
+                ],
+            }
+            for gate in gates
+        ],
+    }
+    config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def configure_gate_rois(
+    image_path: Path,
+    config_path: Path,
+    gate_count: int,
+    display_width: int,
+) -> None:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit(
+            "opencv-python is required for gate configuration. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"Could not read frame for gate configuration: {image_path}")
+
+    height, width = image.shape[:2]
+    scale = min(1.0, display_width / width)
+    display_size = (int(round(width * scale)), int(round(height * scale)))
+    window_name = "Configure gate ROIs"
+    gates: list[GateRoi] = []
+    mode = "roi"
+    start_point: tuple[int, int] | None = None
+    current_point: tuple[int, int] | None = None
+    current_roi: tuple[int, int, int, int] | None = None
+
+    def to_original(point: tuple[int, int]) -> tuple[int, int]:
+        return clamp_point(
+            int(round(point[0] / scale)),
+            int(round(point[1] / scale)),
+            width,
+            height,
+        )
+
+    def on_mouse(event, x, y, _flags, _param) -> None:
+        nonlocal mode, start_point, current_point, current_roi
+        if len(gates) >= gate_count:
+            return
+
+        point = to_original((x, y))
+        if event == cv2.EVENT_LBUTTONDOWN:
+            start_point = point
+            current_point = point
+            return
+
+        if event == cv2.EVENT_MOUSEMOVE and start_point is not None:
+            current_point = point
+            return
+
+        if event != cv2.EVENT_LBUTTONUP or start_point is None:
+            return
+
+        current_point = point
+        if mode == "roi":
+            try:
+                current_roi = normalize_roi(start_point, current_point, width, height)
+            except ValueError as exc:
+                log(str(exc))
+                current_roi = None
+            else:
+                mode = "direction"
+                log(
+                    f"Gate {len(gates) + 1}: drag an arrow in the OUT direction."
+                )
+        else:
+            dx = current_point[0] - start_point[0]
+            dy = current_point[1] - start_point[1]
+            if math.hypot(dx, dy) < 10:
+                log("Direction arrow is too short. Drag a longer OUT direction arrow.")
+            elif current_roi is not None:
+                out_direction = normalize_direction(dx, dy)
+                gates.append(
+                    GateRoi(
+                        name=f"gate_{len(gates) + 1}",
+                        roi=current_roi,
+                        out_direction=out_direction,
+                    )
+                )
+                log(f"Saved gate {len(gates)}/{gate_count}.")
+                current_roi = None
+                mode = "roi"
+
+        start_point = None
+        current_point = None
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, display_size[0], display_size[1])
+    cv2.setMouseCallback(window_name, on_mouse)
+    log("Draw each gate ROI, then drag the arrow in the OUT direction.")
+    log("Keys: u=undo, r=reset current, q/esc=cancel, enter=save when complete.")
+    completion_logged = False
+
+    while True:
+        canvas = image.copy()
+        draw_gate_overlay(canvas, gates)
+
+        if current_roi is not None:
+            x1, y1, x2, y2 = current_roi
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 180, 0), 2)
+
+        if start_point is not None and current_point is not None:
+            if mode == "roi":
+                try:
+                    x1, y1, x2, y2 = normalize_roi(start_point, current_point, width, height)
+                except ValueError:
+                    x1, y1 = start_point
+                    x2, y2 = current_point
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 180, 0), 2)
+            else:
+                cv2.arrowedLine(
+                    canvas,
+                    start_point,
+                    current_point,
+                    (0, 0, 255),
+                    3,
+                    tipLength=0.25,
+                )
+
+        if len(gates) >= gate_count:
+            instruction = "All gates set. Press Enter to save."
+        else:
+            instruction = (
+                f"Gate {len(gates) + 1}/{gate_count}: "
+                + ("draw ROI rectangle" if mode == "roi" else "drag OUT arrow")
+            )
+        cv2.putText(
+            canvas,
+            instruction,
+            (20, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "u undo | r reset current | enter save | q cancel",
+            (20, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        display = cv2.resize(canvas, display_size, interpolation=cv2.INTER_AREA)
+        cv2.imshow(window_name, display)
+        key = cv2.waitKey(30) & 0xFF
+
+        if key in {ord("q"), 27}:
+            cv2.destroyWindow(window_name)
+            raise SystemExit("Gate configuration cancelled.")
+        if key == ord("u") and gates:
+            removed = gates.pop()
+            completion_logged = False
+            log(f"Removed {removed.name}.")
+        if key == ord("r"):
+            mode = "roi"
+            start_point = None
+            current_point = None
+            current_roi = None
+            log("Reset current gate drawing.")
+        if key in {13, 10} and len(gates) >= gate_count:
+            break
+        if len(gates) >= gate_count and not completion_logged:
+            log("All gates are set. Press Enter to save, or u to undo.")
+            completion_logged = True
+
+    preview_path = config_path.with_name(config_path.stem + "_preview.jpg")
+    preview = draw_gate_overlay(image.copy(), gates)
+    cv2.imwrite(str(preview_path), preview)
+    cv2.destroyWindow(window_name)
+    write_gate_config(
+        config_path=config_path,
+        preview_path=preview_path,
+        image_path=image_path,
+        image_size=(width, height),
+        gates=gates,
+    )
+    log(f"Saved gate config to {config_path}")
+    log(f"Saved gate preview to {preview_path}")
 
 
 def extract_frames_from_video(
@@ -579,6 +899,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-roi", action="store_true")
+    parser.add_argument(
+        "--gate-config",
+        default=DEFAULT_GATE_CONFIG,
+        type=Path,
+        help="JSON file containing gate ROI boxes and OUT directions.",
+    )
+    parser.add_argument(
+        "--configure-gates",
+        action="store_true",
+        help="Open a video frame and interactively draw gate ROIs and OUT directions.",
+    )
+    parser.add_argument(
+        "--gate-count",
+        default=2,
+        type=int,
+        help="Number of gate ROIs to configure. Default is 2.",
+    )
+    parser.add_argument(
+        "--gate-frame-index",
+        default=0,
+        type=int,
+        help="Frame index to display when configuring gates.",
+    )
+    parser.add_argument(
+        "--gate-display-width",
+        default=1280,
+        type=int,
+        help="Maximum display width for the interactive gate configuration window.",
+    )
     parser.add_argument("--scale", default=1.2, type=float)
     parser.add_argument("--contrast", default=1.5, type=float)
     parser.add_argument("--sharpness", default=2.0, type=float)
@@ -663,6 +1012,15 @@ def main() -> None:
     if args.max_missing_frames < 0:
         raise ValueError("--max-missing-frames cannot be negative")
 
+    if args.gate_count <= 0:
+        raise ValueError("--gate-count must be greater than zero")
+
+    if args.gate_frame_index < 0:
+        raise ValueError("--gate-frame-index cannot be negative")
+
+    if args.gate_display_width <= 0:
+        raise ValueError("--gate-display-width must be greater than zero")
+
     if not 0 <= args.stitch_iou_threshold <= 1:
         raise ValueError("--stitch-iou-threshold must be between 0 and 1")
 
@@ -672,6 +1030,25 @@ def main() -> None:
     roi = None if args.no_roi or args.roi is None else parse_int_tuple(args.roi, 4, "--roi")
     class_ids = parse_classes(args.classes)
     image_paths, output_csv, frame_interval_sec = resolve_source(args)
+
+    if args.configure_gates:
+        if not image_paths:
+            raise FileNotFoundError(
+                f"No images found with pattern {args.pattern}. Check the video or frame folder."
+            )
+        if args.gate_frame_index >= len(image_paths):
+            raise ValueError(
+                f"--gate-frame-index {args.gate_frame_index} is outside "
+                f"the available frame range 0-{len(image_paths) - 1}"
+            )
+        configure_gate_rois(
+            image_path=image_paths[args.gate_frame_index],
+            config_path=args.gate_config,
+            gate_count=args.gate_count,
+            display_width=args.gate_display_width,
+        )
+        return
+
     if args.max_frames is not None:
         image_paths = image_paths[: args.max_frames]
 
@@ -679,6 +1056,11 @@ def main() -> None:
         raise FileNotFoundError(
             f"No images found with pattern {args.pattern}. Check the video or frame folder."
         )
+
+    gate_rois = load_gate_config(args.gate_config)
+    if gate_rois:
+        gate_names = ", ".join(gate.name for gate in gate_rois)
+        log(f"Loaded {len(gate_rois)} gate ROI(s) from {args.gate_config}: {gate_names}")
 
     log("Loading YOLO/torch. First run can take 1-2 minutes on Windows.")
     try:

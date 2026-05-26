@@ -91,6 +91,33 @@ For this fixed camera, set `--roi x1,y1,x2,y2` to the same exit/driveway area
 after you confirm the correct coordinates. If `--roi` is omitted, the full frame
 is analyzed.
 
+## Gate ROI Direction Setup
+
+Use this mode to draw the two entrance/exit gate areas directly on a video
+frame. For each gate:
+
+1. drag a rectangle around the gate ROI
+2. drag an arrow in the bus OUT direction
+3. press Enter after both gates are set
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
+  --configure-gates `
+  --gate-count 2 `
+  --gate-config ".\configs\gate_rois.json"
+```
+
+The config is saved in original-frame coordinates:
+
+```text
+configs/gate_rois.json
+configs/gate_rois_preview.jpg
+```
+
+The same gate ROI is used for both entering and exiting. Later in/out event
+logic should treat movement along the saved arrow as OUT and movement in the
+opposite direction as IN.
+
 ## Predict Next Departure
 
 ## Manual Label Training
