@@ -188,6 +188,8 @@ def normalize_schema(raw_df: pd.DataFrame) -> pd.DataFrame:
         "bus_count_diff": 0.0,
         "new_bus_count": 0.0,
         "exited_bus_count": np.nan,
+        "gate_in_event_count": 0.0,
+        "gate_out_event_count": 0.0,
         "avg_area": 0.0,
         "avg_area_diff": 0.0,
         "max_area": 0.0,
@@ -195,30 +197,51 @@ def normalize_schema(raw_df: pd.DataFrame) -> pd.DataFrame:
         "avg_waiting_time": 0.0,
         "max_waiting_time": 0.0,
         "seconds_since_last_new_bus": np.nan,
+        "seconds_since_last_out_bus": np.nan,
     }
     for column, default in numeric_defaults.items():
         coerce_numeric(df, column, default)
 
-    if "exited_bus_count" not in raw_df.columns:
-        df["exited_bus_count"] = np.maximum(-df["bus_count_diff"], 0)
-    else:
-        df["exited_bus_count"] = df["exited_bus_count"].fillna(0)
-
     if "new_bus_count" not in raw_df.columns:
         df["new_bus_count"] = np.maximum(df["bus_count_diff"], 0)
+
+    if "gate_in_event_count" in raw_df.columns:
+        in_events = df["gate_in_event_count"].to_numpy(dtype=float) > 0
+    else:
+        in_events = df["new_bus_count"].to_numpy(dtype=float) > 0
+        df["gate_in_event_count"] = in_events.astype(int)
 
     if df["seconds_since_last_new_bus"].isna().any():
         df["seconds_since_last_new_bus"] = fill_time_since_event(
             times=df["time_second"].to_numpy(dtype=float),
-            events=df["new_bus_count"].to_numpy(dtype=float) > 0,
+            events=in_events,
         )
+
+    if "gate_out_event_count" in raw_df.columns:
+        out_events = df["gate_out_event_count"].to_numpy(dtype=float) > 0
+    elif "exited_bus_count" in raw_df.columns:
+        out_events = pd.to_numeric(raw_df["exited_bus_count"], errors="coerce").fillna(0).to_numpy(
+            dtype=float
+        ) > 0
+    else:
+        out_events = df["bus_count_diff"].to_numpy(dtype=float) < 0
+    if "gate_out_event_count" not in raw_df.columns:
+        df["gate_out_event_count"] = out_events.astype(int)
+
+    if df["seconds_since_last_out_bus"].isna().any():
+        df["seconds_since_last_out_bus"] = fill_time_since_event(
+            times=df["time_second"].to_numpy(dtype=float),
+            events=out_events,
+        )
+
+    df["exited_bus_count"] = df["seconds_since_last_out_bus"]
 
     return df.reset_index(drop=True)
 
 
 def infer_departure_events(df: pd.DataFrame) -> np.ndarray:
-    if "exited_bus_count" in df.columns and df["exited_bus_count"].sum() > 0:
-        return df["exited_bus_count"].to_numpy(dtype=float) > 0
+    if "gate_out_event_count" in df.columns and df["gate_out_event_count"].sum() > 0:
+        return df["gate_out_event_count"].to_numpy(dtype=float) > 0
 
     if "bus_ids_inside" in df.columns:
         id_sets = [parse_ids(value) for value in df["bus_ids_inside"]]

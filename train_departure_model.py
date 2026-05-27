@@ -13,7 +13,12 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 
-from bus_departure_predictor import DEFAULT_BINS, FEATURE_COLUMNS, parse_probability_bins
+from bus_departure_predictor import (
+    DEFAULT_BINS,
+    FEATURE_COLUMNS,
+    normalize_schema,
+    parse_probability_bins,
+)
 
 
 DEFAULT_MODEL_PATH = Path("models/departure_random_forest.joblib")
@@ -70,7 +75,7 @@ def prepare_training_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Training CSV is missing required columns: {missing}")
 
-    training_df = df.copy()
+    training_df = normalize_schema(df.copy())
     training_df["time_until_next_departure"] = pd.to_numeric(
         training_df["time_until_next_departure"],
         errors="coerce",

@@ -25,4 +25,8 @@ models/*.json
 data/labels/*.csv
 !data/labels/.gitkeep
 
+configs/*.json
+configs/*_preview.jpg
+!configs/.gitkeep
+
 runs/

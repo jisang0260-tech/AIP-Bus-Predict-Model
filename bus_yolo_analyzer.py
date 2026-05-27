@@ -6,7 +6,7 @@ import json
 import math
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +20,8 @@ DEFAULT_VIDEO_DIR = Path("data/videos")
 DEFAULT_FRAMES_DIR = Path("data/frames")
 DEFAULT_OUTPUT_DIR = Path("outputs")
 DEFAULT_GATE_CONFIG = Path("configs/gate_rois.json")
+DEFAULT_GATE_DIRECTION_THRESHOLD = 0.45
+DEFAULT_GATE_MIN_MOVEMENT_PX = 12.0
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
 
@@ -34,6 +36,8 @@ class DetectionSummary:
     exited_ids: list[int]
     recovered_ids: list[int]
     raw_id_switches: int
+    gate_in_ids: list[int]
+    gate_out_ids: list[int]
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ class LogicalTrack:
     last_seen_frame: int
     last_box: tuple[float, float, float, float]
     raw_ids: set[int]
+    gate_triggered_directions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,40 @@ def load_gate_config(config_path: Path | None) -> list[GateRoi]:
         )
 
     return gates
+
+
+def transform_gate_rois(
+    gates: list[GateRoi],
+    crop_roi: tuple[int, int, int, int] | None,
+    scale: float,
+) -> list[GateRoi]:
+    transformed: list[GateRoi] = []
+    for gate in gates:
+        x1, y1, x2, y2 = gate.roi
+        if crop_roi is not None:
+            crop_x1, crop_y1, crop_x2, crop_y2 = crop_roi
+            x1 = max(x1, crop_x1) - crop_x1
+            y1 = max(y1, crop_y1) - crop_y1
+            x2 = min(x2, crop_x2) - crop_x1
+            y2 = min(y2, crop_y2) - crop_y1
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+        if scale != 1.0:
+            x1 = int(round(x1 * scale))
+            y1 = int(round(y1 * scale))
+            x2 = int(round(x2 * scale))
+            y2 = int(round(y2 * scale))
+
+        transformed.append(
+            GateRoi(
+                name=gate.name,
+                roi=(int(x1), int(y1), int(x2), int(y2)),
+                out_direction=gate.out_direction,
+            )
+        )
+
+    return transformed
 
 
 def draw_gate_overlay(image, gates: list[GateRoi], scale: float = 1.0):
@@ -622,6 +661,12 @@ def box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
 
+def point_in_roi(point: tuple[float, float], roi: tuple[int, int, int, int]) -> bool:
+    x, y = point
+    x1, y1, x2, y2 = roi
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
 def box_iou(
     left: tuple[float, float, float, float],
     right: tuple[float, float, float, float],
@@ -665,6 +710,59 @@ def geometric_match_score(
     return None
 
 
+def detect_gate_events(
+    track: LogicalTrack,
+    observation: TrackObservation,
+    gates: list[GateRoi],
+    direction_threshold: float,
+    min_movement_px: float,
+) -> tuple[list[int], list[int]]:
+    if not gates:
+        return [], []
+
+    prev_center = box_center(track.last_box)
+    curr_center = (observation.center_x, observation.center_y)
+    move_x = curr_center[0] - prev_center[0]
+    move_y = curr_center[1] - prev_center[1]
+    move_length = math.hypot(move_x, move_y)
+    move_direction = (0.0, 0.0)
+    if move_length > 0:
+        move_direction = (move_x / move_length, move_y / move_length)
+
+    gate_in_ids: list[int] = []
+    gate_out_ids: list[int] = []
+
+    for gate in gates:
+        gate_key = gate.name
+        prev_inside = point_in_roi(prev_center, gate.roi)
+        curr_inside = point_in_roi(curr_center, gate.roi)
+
+        if not prev_inside and curr_inside:
+            track.gate_triggered_directions.pop(gate_key, None)
+        elif prev_inside and not curr_inside:
+            track.gate_triggered_directions.pop(gate_key, None)
+            continue
+
+        if not curr_inside or move_length < min_movement_px:
+            continue
+
+        if gate_key in track.gate_triggered_directions:
+            continue
+
+        direction_alignment = (
+            move_direction[0] * gate.out_direction[0]
+            + move_direction[1] * gate.out_direction[1]
+        )
+        if direction_alignment >= direction_threshold:
+            gate_out_ids.append(track.logical_id)
+            track.gate_triggered_directions[gate_key] = "out"
+        elif direction_alignment <= -direction_threshold:
+            gate_in_ids.append(track.logical_id)
+            track.gate_triggered_directions[gate_key] = "in"
+
+    return gate_in_ids, gate_out_ids
+
+
 def summarize_detections(
     result,
     current_time: float,
@@ -675,6 +773,9 @@ def summarize_detections(
     max_missing_frames: int,
     stitch_iou_threshold: float,
     stitch_center_threshold: float,
+    gates: list[GateRoi],
+    gate_direction_threshold: float,
+    gate_min_movement_px: float,
 ) -> tuple[DetectionSummary, int]:
     observations = get_observations(result)
     assigned_tracks: set[int] = set()
@@ -682,6 +783,8 @@ def summarize_detections(
     new_ids: list[int] = []
     recovered_ids: list[int] = []
     raw_id_switches = 0
+    gate_in_ids: list[int] = []
+    gate_out_ids: list[int] = []
 
     def assign_observation(
         observation: TrackObservation,
@@ -689,7 +792,8 @@ def summarize_detections(
     ) -> None:
         nonlocal raw_id_switches
         track = logical_tracks[logical_id]
-        if frame_index - track.last_seen_frame > 1:
+        frame_gap = frame_index - track.last_seen_frame
+        if frame_gap > 1:
             recovered_ids.append(logical_id)
 
         if observation.raw_id is not None:
@@ -697,6 +801,19 @@ def summarize_detections(
                 raw_id_switches += 1
             track.raw_ids.add(observation.raw_id)
             raw_to_logical[observation.raw_id] = logical_id
+
+        if frame_gap <= 1:
+            track_gate_in_ids, track_gate_out_ids = detect_gate_events(
+                track=track,
+                observation=observation,
+                gates=gates,
+                direction_threshold=gate_direction_threshold,
+                min_movement_px=gate_min_movement_px,
+            )
+            gate_in_ids.extend(track_gate_in_ids)
+            gate_out_ids.extend(track_gate_out_ids)
+        else:
+            track.gate_triggered_directions.clear()
 
         track.last_seen_frame = frame_index
         track.last_box = observation.box
@@ -801,6 +918,8 @@ def summarize_detections(
             exited_ids=stale_ids,
             recovered_ids=sorted(set(recovered_ids)),
             raw_id_switches=raw_id_switches,
+            gate_in_ids=sorted(set(gate_in_ids)),
+            gate_out_ids=sorted(set(gate_out_ids)),
         ),
         next_logical_id,
     )
@@ -1061,6 +1180,9 @@ def main() -> None:
     if gate_rois:
         gate_names = ", ".join(gate.name for gate in gate_rois)
         log(f"Loaded {len(gate_rois)} gate ROI(s) from {args.gate_config}: {gate_names}")
+    active_gate_rois = transform_gate_rois(gate_rois, roi, args.scale)
+    if gate_rois and not active_gate_rois:
+        log("Warning: all configured gate ROIs fell outside the active analysis ROI.")
 
     log("Loading YOLO/torch. First run can take 1-2 minutes on Windows.")
     try:
@@ -1089,6 +1211,7 @@ def main() -> None:
     previous_count = 0
     previous_avg_area = 0.0
     last_new_bus_time: float | None = None
+    last_out_bus_time: float | None = None
 
     total_frames = len(image_paths)
     for frame_index, image_path in enumerate(image_paths):
@@ -1130,10 +1253,21 @@ def main() -> None:
             max_missing_frames=args.max_missing_frames,
             stitch_iou_threshold=args.stitch_iou_threshold,
             stitch_center_threshold=args.stitch_center_threshold,
+            gates=active_gate_rois,
+            gate_direction_threshold=DEFAULT_GATE_DIRECTION_THRESHOLD,
+            gate_min_movement_px=DEFAULT_GATE_MIN_MOVEMENT_PX,
         )
 
-        if summary.new_ids:
-            last_new_bus_time = current_time
+        if active_gate_rois:
+            if summary.gate_in_ids:
+                last_new_bus_time = current_time
+            if summary.gate_out_ids:
+                last_out_bus_time = current_time
+        else:
+            if summary.new_ids:
+                last_new_bus_time = current_time
+            if summary.exited_ids:
+                last_out_bus_time = current_time
 
         avg_area = sum(summary.areas) / len(summary.areas) if summary.areas else 0.0
         max_area = max(summary.areas) if summary.areas else 0.0
@@ -1146,6 +1280,9 @@ def main() -> None:
         max_waiting_time = max(summary.waiting_times) if summary.waiting_times else 0.0
         seconds_since_last_new_bus = (
             current_time - last_new_bus_time if last_new_bus_time is not None else None
+        )
+        seconds_since_last_out_bus = (
+            current_time - last_out_bus_time if last_out_bus_time is not None else None
         )
 
         rows.append(
@@ -1160,8 +1297,18 @@ def main() -> None:
                 "raw_tracker_ids_inside": ";".join(str(track_id) for track_id in summary.raw_ids),
                 "new_bus_count": len(summary.new_ids),
                 "new_bus_ids": ";".join(str(track_id) for track_id in summary.new_ids),
-                "exited_bus_count": len(summary.exited_ids),
-                "exited_bus_ids": ";".join(str(track_id) for track_id in summary.exited_ids),
+                "gate_in_event_count": len(summary.gate_in_ids),
+                "gate_in_event_ids": ";".join(str(track_id) for track_id in summary.gate_in_ids),
+                "exited_bus_count": (
+                    round(seconds_since_last_out_bus, 3)
+                    if seconds_since_last_out_bus is not None
+                    else ""
+                ),
+                "exited_bus_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
+                "gate_out_event_count": len(summary.gate_out_ids),
+                "gate_out_event_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
+                "tracker_exited_bus_count": len(summary.exited_ids),
+                "tracker_exited_bus_ids": ";".join(str(track_id) for track_id in summary.exited_ids),
                 "recovered_bus_count": len(summary.recovered_ids),
                 "recovered_bus_ids": ";".join(str(track_id) for track_id in summary.recovered_ids),
                 "raw_id_switch_count": summary.raw_id_switches,
@@ -1175,6 +1322,11 @@ def main() -> None:
                 "seconds_since_last_new_bus": (
                     round(seconds_since_last_new_bus, 3)
                     if seconds_since_last_new_bus is not None
+                    else ""
+                ),
+                "seconds_since_last_out_bus": (
+                    round(seconds_since_last_out_bus, 3)
+                    if seconds_since_last_out_bus is not None
                     else ""
                 ),
             }

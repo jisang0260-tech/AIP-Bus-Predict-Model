@@ -118,6 +118,11 @@ The same gate ROI is used for both entering and exiting. Later in/out event
 logic should treat movement along the saved arrow as OUT and movement in the
 opposite direction as IN.
 
+When a gate config is present, the analyzer now resets:
+
+- `seconds_since_last_new_bus` when a bus moves through a gate ROI in the IN direction
+- `exited_bus_count` and `seconds_since_last_out_bus` when a bus moves through a gate ROI in the OUT direction
+
 ## Predict Next Departure
 
 ## Manual Label Training
@@ -188,6 +193,9 @@ the older CSV-history method.
 - `recovered_bus_count`: Logical IDs recovered after being missed for one or more frames.
 - `remaining_time`: Same value as `total_waiting_time`, kept for the next model.
 - `total_waiting_time`: Sum of waiting time for buses currently inside the ROI.
+- `seconds_since_last_new_bus`: Seconds since the most recent gate IN event.
+- `exited_bus_count`: Seconds since the most recent gate OUT event.
+- `gate_in_event_count`, `gate_out_event_count`: Gate crossing events detected on the current frame.
 - `avg_waiting_time`: Average waiting time for buses currently inside the ROI.
 - `max_waiting_time`: Longest waiting time among buses currently inside the ROI.
 - `new_bus_count`, `exited_bus_count`: Buses that entered or exited on this frame.
