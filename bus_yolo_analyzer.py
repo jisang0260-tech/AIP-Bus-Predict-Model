@@ -76,6 +76,7 @@ class DebugPreviewWriter:
     video_path: Path
     fps: float
     save_frames: bool
+    save_video: bool
     enabled: bool
     frame_counter: int = 0
     writer: object | None = None
@@ -327,6 +328,7 @@ def build_debug_preview_writer(
     output_dir: Path,
     fps: float,
     save_frames: bool,
+    save_video: bool,
     enabled: bool,
 ) -> DebugPreviewWriter:
     video_path = output_dir / "preview.mp4"
@@ -335,6 +337,7 @@ def build_debug_preview_writer(
         video_path=video_path,
         fps=max(fps, 1.0),
         save_frames=save_frames,
+        save_video=save_video,
         enabled=enabled,
     )
     if not enabled:
@@ -500,7 +503,7 @@ def write_debug_preview_frame(
             "pip install -r requirements.txt"
         ) from exc
 
-    if debug_preview.writer is None:
+    if debug_preview.save_video and debug_preview.writer is None:
         height, width = frame.shape[:2]
         writer = cv2.VideoWriter(
             str(debug_preview.video_path),
@@ -512,8 +515,9 @@ def write_debug_preview_frame(
             raise RuntimeError(f"Could not open debug preview video for writing: {debug_preview.video_path}")
         debug_preview.writer = writer
 
-    writer = debug_preview.writer
-    writer.write(frame)
+    if debug_preview.save_video:
+        writer = debug_preview.writer
+        writer.write(frame)
 
     if debug_preview.save_frames:
         frame_path = debug_preview.output_dir / "frames" / f"{Path(source_name).stem}_debug.jpg"
@@ -1292,6 +1296,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also save annotated jpg frames inside the debug preview directory.",
     )
+    parser.add_argument(
+        "--debug-preview-frames-only",
+        action="store_true",
+        help="Save only annotated jpg frames for debug preview and skip preview.mp4 creation.",
+    )
     parser.add_argument("--scale", default=1.2, type=float)
     parser.add_argument("--contrast", default=1.5, type=float)
     parser.add_argument("--sharpness", default=2.0, type=float)
@@ -1432,6 +1441,12 @@ def main() -> None:
     if gate_rois and not active_gate_rois:
         log("Warning: all configured gate ROIs fell outside the active analysis ROI.")
 
+    debug_preview_enabled = args.debug_preview or args.debug_preview_frames_only
+    debug_preview_save_video = not args.debug_preview_frames_only
+    debug_preview_save_frames = (
+        args.debug_preview_save_frames or args.debug_preview_frames_only
+    )
+
     debug_preview_dir = (
         args.debug_preview_dir
         if args.debug_preview_dir is not None
@@ -1440,11 +1455,15 @@ def main() -> None:
     debug_preview = build_debug_preview_writer(
         output_dir=debug_preview_dir,
         fps=max(1.0 / frame_interval_sec, 1.0),
-        save_frames=args.debug_preview_save_frames,
-        enabled=args.debug_preview,
+        save_frames=debug_preview_save_frames,
+        save_video=debug_preview_save_video,
+        enabled=debug_preview_enabled,
     )
     if debug_preview.enabled:
-        log(f"Debug preview enabled: {debug_preview.video_path}")
+        if debug_preview.save_video:
+            log(f"Debug preview enabled: {debug_preview.video_path}")
+        else:
+            log(f"Debug preview frames-only mode enabled: {debug_preview.output_dir / 'frames'}")
         if debug_preview.save_frames:
             log(f"Debug preview frames will be saved to {debug_preview.output_dir / 'frames'}")
 
@@ -1623,7 +1642,8 @@ def main() -> None:
     write_csv(rows, output_csv)
     log(f"Saved {len(rows)} rows to {output_csv}")
     if debug_preview.enabled:
-        log(f"Saved debug preview video to {debug_preview.video_path}")
+        if debug_preview.save_video:
+            log(f"Saved debug preview video to {debug_preview.video_path}")
         if debug_preview.save_frames:
             log(f"Saved debug preview frames to {debug_preview.output_dir / 'frames'}")
 

@@ -149,7 +149,7 @@ The default preview output path is:
 outputs/debug_preview/<csv_stem>/preview.mp4
 ```
 
-To also save annotated jpg frames:
+To save only annotated jpg frames and skip mp4 creation:
 
 ```powershell
 .\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
@@ -158,8 +158,7 @@ To also save annotated jpg frames:
   --max-frames 41 `
   --output-csv ".\outputs\debug_12m22s.csv" `
   --gate-config ".\configs\gate_rois.json" `
-  --debug-preview `
-  --debug-preview-save-frames
+  --debug-preview-frames-only
 ```
 
 That command is useful when you want to inspect only one label window, for example
