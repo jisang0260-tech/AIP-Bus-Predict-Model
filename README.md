@@ -87,6 +87,9 @@ Useful tuning options:
   --stitch-center-threshold 0.45
 ```
 
+The current default is `--max-missing-frames 6`.
+The current default gate direction threshold is `0.6`.
+
 For this fixed camera, set `--roi x1,y1,x2,y2` to the same exit/driveway area
 after you confirm the correct coordinates. If `--roi` is omitted, the full frame
 is analyzed.

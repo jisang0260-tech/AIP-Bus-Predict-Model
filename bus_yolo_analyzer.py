@@ -22,7 +22,7 @@ DEFAULT_FRAMES_DIR = Path("data/frames")
 DEFAULT_OUTPUT_DIR = Path("outputs")
 DEFAULT_DEBUG_PREVIEW_ROOT = DEFAULT_OUTPUT_DIR / "debug_preview"
 DEFAULT_GATE_CONFIG = Path("configs/gate_rois.json")
-DEFAULT_GATE_DIRECTION_THRESHOLD = 0.45
+DEFAULT_GATE_DIRECTION_THRESHOLD = 0.6
 DEFAULT_GATE_MIN_MOVEMENT_PX = 12.0
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 
@@ -1307,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--median-filter-size", default=3, type=int)
     parser.add_argument(
         "--max-missing-frames",
-        default=30,
+        default=6,
         type=int,
         help="Keep a logical bus ID alive for this many missed frames.",
     )
