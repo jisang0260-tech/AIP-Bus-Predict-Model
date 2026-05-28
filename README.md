@@ -34,6 +34,24 @@ the source video in `data/videos`.
 .\.venv\Scripts\python.exe .\bus_yolo_analyzer.py
 ```
 
+If you want a GPU-aware setup script, use `setup_env2.ps1` instead:
+
+```powershell
+.\setup_env2.ps1 -Mode auto
+```
+
+Modes:
+
+- `-Mode auto`: use CUDA PyTorch when an NVIDIA GPU is detected by `nvidia-smi`, otherwise CPU
+- `-Mode gpu`: require an NVIDIA GPU and install CUDA PyTorch
+- `-Mode cpu`: force CPU PyTorch
+
+Optional CUDA wheel selector:
+
+```powershell
+.\setup_env2.ps1 -Mode gpu -CudaVariant cu118
+```
+
 For a quick test before running the full video:
 
 ```powershell
