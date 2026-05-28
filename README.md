@@ -123,6 +123,48 @@ When a gate config is present, the analyzer now resets:
 - `seconds_since_last_new_bus` when a bus moves through a gate ROI in the IN direction
 - `exited_bus_count` and `seconds_since_last_out_bus` when a bus moves through a gate ROI in the OUT direction
 
+## Debug Preview
+
+Use this when you want to visually inspect:
+
+- YOLO raw tracker behavior
+- logical ID stitching
+- held tracks that survive missing frames
+- gate ROI overlays
+- IN / OUT events on the exact frame they fire
+
+Example: generate only the debug preview mp4.
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
+  --image-dir ".\data\frames\20260519_133357" `
+  --output-csv ".\outputs\20260519_133357_vehicle_counts.csv" `
+  --gate-config ".\configs\gate_rois.json" `
+  --debug-preview
+```
+
+The default preview output path is:
+
+```text
+outputs/debug_preview/<csv_stem>/preview.mp4
+```
+
+To also save annotated jpg frames:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_yolo_analyzer.py `
+  --image-dir ".\data\frames\20260519_133357" `
+  --skip-frames 721 `
+  --max-frames 41 `
+  --output-csv ".\outputs\debug_12m22s.csv" `
+  --gate-config ".\configs\gate_rois.json" `
+  --debug-preview `
+  --debug-preview-save-frames
+```
+
+That command is useful when you want to inspect only one label window, for example
+`00:12:22 +/- 20 sec`.
+
 ## Predict Next Departure
 
 ## Manual Label Training
@@ -195,10 +237,13 @@ the older CSV-history method.
 - `total_waiting_time`: Sum of waiting time for buses currently inside the ROI.
 - `seconds_since_last_new_bus`: Seconds since the most recent gate IN event.
 - `exited_bus_count`: Seconds since the most recent gate OUT event.
+- `seconds_since_last_out_bus`: Same OUT elapsed time, kept as an explicit column.
 - `gate_in_event_count`, `gate_out_event_count`: Gate crossing events detected on the current frame.
+- `gate_in_event_ids`, `gate_out_event_ids`: Logical IDs that triggered the gate event on the current frame.
+- `tracker_exited_bus_count`, `tracker_exited_bus_ids`: Logical tracks removed because they exceeded `max_missing_frames`.
 - `avg_waiting_time`: Average waiting time for buses currently inside the ROI.
 - `max_waiting_time`: Longest waiting time among buses currently inside the ROI.
-- `new_bus_count`, `exited_bus_count`: Buses that entered or exited on this frame.
+- `new_bus_count`, `new_bus_ids`: Newly created logical tracks on the current frame.
 
 The old notebook's `remaining_time` column represented time until the next scheduled
 bus arrival. In this version, `remaining_time` means the total waiting time of

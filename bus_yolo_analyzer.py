@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -19,6 +20,7 @@ DEFAULT_BUS_CLASSES = (5,)
 DEFAULT_VIDEO_DIR = Path("data/videos")
 DEFAULT_FRAMES_DIR = Path("data/frames")
 DEFAULT_OUTPUT_DIR = Path("outputs")
+DEFAULT_DEBUG_PREVIEW_ROOT = DEFAULT_OUTPUT_DIR / "debug_preview"
 DEFAULT_GATE_CONFIG = Path("configs/gate_rois.json")
 DEFAULT_GATE_DIRECTION_THRESHOLD = 0.45
 DEFAULT_GATE_MIN_MOVEMENT_PX = 12.0
@@ -56,6 +58,8 @@ class LogicalTrack:
     last_seen_frame: int
     last_box: tuple[float, float, float, float]
     raw_ids: set[int]
+    last_raw_id: int | None = None
+    prev_box: tuple[float, float, float, float] | None = None
     gate_triggered_directions: dict[str, str] = field(default_factory=dict)
 
 
@@ -64,6 +68,26 @@ class GateRoi:
     name: str
     roi: tuple[int, int, int, int]
     out_direction: tuple[float, float]
+
+
+@dataclass
+class DebugPreviewWriter:
+    output_dir: Path
+    video_path: Path
+    fps: float
+    save_frames: bool
+    enabled: bool
+    frame_counter: int = 0
+    writer: object | None = None
+
+
+def format_id_list(values: list[int], limit: int = 8) -> str:
+    if not values:
+        return "-"
+    if len(values) <= limit:
+        return ",".join(str(value) for value in values)
+    preview = ",".join(str(value) for value in values[:limit])
+    return f"{preview},...(+{len(values) - limit})"
 
 
 def parse_time_to_seconds(value: str) -> int:
@@ -297,6 +321,208 @@ def draw_gate_overlay(image, gates: list[GateRoi], scale: float = 1.0):
             cv2.LINE_AA,
         )
     return image
+
+
+def build_debug_preview_writer(
+    output_dir: Path,
+    fps: float,
+    save_frames: bool,
+    enabled: bool,
+) -> DebugPreviewWriter:
+    video_path = output_dir / "preview.mp4"
+    debug_preview = DebugPreviewWriter(
+        output_dir=output_dir,
+        video_path=video_path,
+        fps=max(fps, 1.0),
+        save_frames=save_frames,
+        enabled=enabled,
+    )
+    if not enabled:
+        return debug_preview
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if save_frames:
+        (output_dir / "frames").mkdir(parents=True, exist_ok=True)
+    return debug_preview
+
+
+def release_debug_preview_writer(debug_preview: DebugPreviewWriter | None) -> None:
+    if debug_preview is None or debug_preview.writer is None:
+        return
+
+    writer = debug_preview.writer
+    debug_preview.writer = None
+    release = getattr(writer, "release", None)
+    if callable(release):
+        release()
+
+
+def render_debug_preview(
+    image: Image.Image,
+    logical_tracks: dict[int, LogicalTrack],
+    summary: DetectionSummary,
+    gates: list[GateRoi],
+    frame_index: int,
+    current_time: float,
+    max_missing_frames: int,
+    seconds_since_last_new_bus: float | None,
+    seconds_since_last_out_bus: float | None,
+) -> np.ndarray:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit(
+            "opencv-python is required for debug preview. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    draw_gate_overlay(frame, gates)
+
+    gate_in_ids = set(summary.gate_in_ids)
+    gate_out_ids = set(summary.gate_out_ids)
+    active_tracks = sorted(
+        (
+            track
+            for track in logical_tracks.values()
+            if frame_index - track.last_seen_frame <= max_missing_frames
+        ),
+        key=lambda track: track.logical_id,
+    )
+
+    for track in active_tracks:
+        x1, y1, x2, y2 = (int(round(value)) for value in track.last_box)
+        missing_frames = frame_index - track.last_seen_frame
+        seen_this_frame = missing_frames == 0
+        if track.logical_id in gate_out_ids:
+            color = (0, 0, 255)
+            event_label = "OUT"
+        elif track.logical_id in gate_in_ids:
+            color = (255, 220, 0)
+            event_label = "IN"
+        elif seen_this_frame:
+            color = (0, 200, 0)
+            event_label = "LIVE"
+        else:
+            color = (0, 220, 255)
+            event_label = "HELD"
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        if seen_this_frame and track.prev_box is not None:
+            prev_center = tuple(int(round(value)) for value in box_center(track.prev_box))
+            curr_center = tuple(int(round(value)) for value in box_center(track.last_box))
+            cv2.arrowedLine(frame, prev_center, curr_center, color, 2, tipLength=0.25)
+
+        label = (
+            f"L{track.logical_id}"
+            f" R{track.last_raw_id if track.last_raw_id is not None else '-'}"
+            f" miss={missing_frames}"
+            f" {event_label}"
+        )
+        label_origin = (x1, max(22, y1 - 8))
+        label_size, baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
+        )
+        cv2.rectangle(
+            frame,
+            (label_origin[0] - 2, label_origin[1] - label_size[1] - 6),
+            (
+                label_origin[0] + label_size[0] + 2,
+                label_origin[1] + baseline + 2,
+            ),
+            (20, 20, 20),
+            thickness=-1,
+        )
+        cv2.putText(
+            frame,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    info_lines = [
+        f"time={seconds_to_hhmmss(current_time)} frame={frame_index} count={summary.count}",
+        (
+            "gate_in="
+            f"{format_id_list(summary.gate_in_ids)} "
+            f"since_in={'-' if seconds_since_last_new_bus is None else f'{seconds_since_last_new_bus:.1f}s'}"
+        ),
+        (
+            "gate_out="
+            f"{format_id_list(summary.gate_out_ids)} "
+            f"since_out={'-' if seconds_since_last_out_bus is None else f'{seconds_since_last_out_bus:.1f}s'}"
+        ),
+        (
+            "new="
+            f"{format_id_list(summary.new_ids)} "
+            f"recovered={format_id_list(summary.recovered_ids)} "
+            f"tracker_exit={format_id_list(summary.exited_ids)}"
+        ),
+    ]
+    max_width = max(
+        cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)[0][0]
+        for line in info_lines
+    )
+    panel_height = 18 + len(info_lines) * 24
+    cv2.rectangle(frame, (8, 8), (24 + max_width, panel_height), (15, 15, 15), -1)
+    for line_index, line in enumerate(info_lines):
+        cv2.putText(
+            frame,
+            line,
+            (18, 30 + line_index * 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return frame
+
+
+def write_debug_preview_frame(
+    debug_preview: DebugPreviewWriter | None,
+    frame: np.ndarray,
+    source_name: str,
+) -> None:
+    if debug_preview is None or not debug_preview.enabled:
+        return
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit(
+            "opencv-python is required for debug preview. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    if debug_preview.writer is None:
+        height, width = frame.shape[:2]
+        writer = cv2.VideoWriter(
+            str(debug_preview.video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            debug_preview.fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open debug preview video for writing: {debug_preview.video_path}")
+        debug_preview.writer = writer
+
+    writer = debug_preview.writer
+    writer.write(frame)
+
+    if debug_preview.save_frames:
+        frame_path = debug_preview.output_dir / "frames" / f"{Path(source_name).stem}_debug.jpg"
+        encoded_ok, encoded = cv2.imencode(".jpg", frame)
+        if not encoded_ok:
+            raise RuntimeError(f"Could not encode debug preview frame for {source_name}")
+        frame_path.write_bytes(encoded.tobytes())
+
+    debug_preview.frame_counter += 1
 
 
 def write_gate_config(
@@ -801,6 +1027,7 @@ def summarize_detections(
                 raw_id_switches += 1
             track.raw_ids.add(observation.raw_id)
             raw_to_logical[observation.raw_id] = logical_id
+            track.last_raw_id = observation.raw_id
 
         if frame_gap <= 1:
             track_gate_in_ids, track_gate_out_ids = detect_gate_events(
@@ -815,6 +1042,7 @@ def summarize_detections(
         else:
             track.gate_triggered_directions.clear()
 
+        track.prev_box = track.last_box
         track.last_seen_frame = frame_index
         track.last_box = observation.box
         assigned_tracks.add(logical_id)
@@ -872,6 +1100,7 @@ def summarize_detections(
             last_seen_frame=frame_index,
             last_box=observation.box,
             raw_ids=raw_ids,
+            last_raw_id=observation.raw_id,
         )
         if observation.raw_id is not None:
             raw_to_logical[observation.raw_id] = logical_id
@@ -1047,6 +1276,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Maximum display width for the interactive gate configuration window.",
     )
+    parser.add_argument(
+        "--debug-preview",
+        action="store_true",
+        help="Save an annotated mp4 preview with logical IDs, gate ROI overlays, and IN/OUT events.",
+    )
+    parser.add_argument(
+        "--debug-preview-dir",
+        default=None,
+        type=Path,
+        help="Directory where debug preview files are saved. Defaults to outputs/debug_preview/<csv_stem>.",
+    )
+    parser.add_argument(
+        "--debug-preview-save-frames",
+        action="store_true",
+        help="Also save annotated jpg frames inside the debug preview directory.",
+    )
     parser.add_argument("--scale", default=1.2, type=float)
     parser.add_argument("--contrast", default=1.5, type=float)
     parser.add_argument("--sharpness", default=2.0, type=float)
@@ -1140,6 +1385,9 @@ def main() -> None:
     if args.gate_display_width <= 0:
         raise ValueError("--gate-display-width must be greater than zero")
 
+    if args.debug_preview_dir is not None and args.debug_preview_dir.name.strip() == "":
+        raise ValueError("--debug-preview-dir must not be empty")
+
     if not 0 <= args.stitch_iou_threshold <= 1:
         raise ValueError("--stitch-iou-threshold must be between 0 and 1")
 
@@ -1184,6 +1432,22 @@ def main() -> None:
     if gate_rois and not active_gate_rois:
         log("Warning: all configured gate ROIs fell outside the active analysis ROI.")
 
+    debug_preview_dir = (
+        args.debug_preview_dir
+        if args.debug_preview_dir is not None
+        else DEFAULT_DEBUG_PREVIEW_ROOT / output_csv.stem
+    )
+    debug_preview = build_debug_preview_writer(
+        output_dir=debug_preview_dir,
+        fps=max(1.0 / frame_interval_sec, 1.0),
+        save_frames=args.debug_preview_save_frames,
+        enabled=args.debug_preview,
+    )
+    if debug_preview.enabled:
+        log(f"Debug preview enabled: {debug_preview.video_path}")
+        if debug_preview.save_frames:
+            log(f"Debug preview frames will be saved to {debug_preview.output_dir / 'frames'}")
+
     log("Loading YOLO/torch. First run can take 1-2 minutes on Windows.")
     try:
         from ultralytics import YOLO
@@ -1214,129 +1478,154 @@ def main() -> None:
     last_out_bus_time: float | None = None
 
     total_frames = len(image_paths)
-    for frame_index, image_path in enumerate(image_paths):
-        if (
-            args.progress_every > 0
-            and (frame_index == 0 or (frame_index + 1) % args.progress_every == 0)
-        ):
-            log(f"Analyzing frame {frame_index + 1}/{total_frames}: {image_path.name}")
+    try:
+        for frame_index, image_path in enumerate(image_paths):
+            if (
+                args.progress_every > 0
+                and (frame_index == 0 or (frame_index + 1) % args.progress_every == 0)
+            ):
+                log(f"Analyzing frame {frame_index + 1}/{total_frames}: {image_path.name}")
 
-        current_time = args.start_time + frame_index * frame_interval_sec
-        image = preprocess_image(
-            image_path=image_path,
-            roi=roi,
-            scale=args.scale,
-            contrast=args.contrast,
-            sharpness=args.sharpness,
-            median_filter_size=args.median_filter_size,
-        )
+            current_time = args.start_time + frame_index * frame_interval_sec
+            image = preprocess_image(
+                image_path=image_path,
+                roi=roi,
+                scale=args.scale,
+                contrast=args.contrast,
+                sharpness=args.sharpness,
+                median_filter_size=args.median_filter_size,
+            )
 
-        results = model.track(
-            source=image,
-            persist=True,
-            tracker=args.tracker,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            iou=args.iou,
-            classes=class_ids,
-            device=args.device,
-            verbose=False,
-        )
+            results = model.track(
+                source=image,
+                persist=True,
+                tracker=args.tracker,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                iou=args.iou,
+                classes=class_ids,
+                device=args.device,
+                verbose=False,
+            )
 
-        summary, next_logical_id = summarize_detections(
-            result=results[0],
-            current_time=current_time,
-            logical_tracks=logical_tracks,
-            raw_to_logical=raw_to_logical,
-            next_logical_id=next_logical_id,
-            frame_index=frame_index,
-            max_missing_frames=args.max_missing_frames,
-            stitch_iou_threshold=args.stitch_iou_threshold,
-            stitch_center_threshold=args.stitch_center_threshold,
-            gates=active_gate_rois,
-            gate_direction_threshold=DEFAULT_GATE_DIRECTION_THRESHOLD,
-            gate_min_movement_px=DEFAULT_GATE_MIN_MOVEMENT_PX,
-        )
+            summary, next_logical_id = summarize_detections(
+                result=results[0],
+                current_time=current_time,
+                logical_tracks=logical_tracks,
+                raw_to_logical=raw_to_logical,
+                next_logical_id=next_logical_id,
+                frame_index=frame_index,
+                max_missing_frames=args.max_missing_frames,
+                stitch_iou_threshold=args.stitch_iou_threshold,
+                stitch_center_threshold=args.stitch_center_threshold,
+                gates=active_gate_rois,
+                gate_direction_threshold=DEFAULT_GATE_DIRECTION_THRESHOLD,
+                gate_min_movement_px=DEFAULT_GATE_MIN_MOVEMENT_PX,
+            )
 
-        if active_gate_rois:
-            if summary.gate_in_ids:
-                last_new_bus_time = current_time
-            if summary.gate_out_ids:
-                last_out_bus_time = current_time
-        else:
-            if summary.new_ids:
-                last_new_bus_time = current_time
-            if summary.exited_ids:
-                last_out_bus_time = current_time
+            if active_gate_rois:
+                if summary.gate_in_ids:
+                    last_new_bus_time = current_time
+                if summary.gate_out_ids:
+                    last_out_bus_time = current_time
+            else:
+                if summary.new_ids:
+                    last_new_bus_time = current_time
+                if summary.exited_ids:
+                    last_out_bus_time = current_time
 
-        avg_area = sum(summary.areas) / len(summary.areas) if summary.areas else 0.0
-        max_area = max(summary.areas) if summary.areas else 0.0
-        total_waiting_time = sum(summary.waiting_times)
-        avg_waiting_time = (
-            total_waiting_time / len(summary.waiting_times)
-            if summary.waiting_times
-            else 0.0
-        )
-        max_waiting_time = max(summary.waiting_times) if summary.waiting_times else 0.0
-        seconds_since_last_new_bus = (
-            current_time - last_new_bus_time if last_new_bus_time is not None else None
-        )
-        seconds_since_last_out_bus = (
-            current_time - last_out_bus_time if last_out_bus_time is not None else None
-        )
+            avg_area = sum(summary.areas) / len(summary.areas) if summary.areas else 0.0
+            max_area = max(summary.areas) if summary.areas else 0.0
+            total_waiting_time = sum(summary.waiting_times)
+            avg_waiting_time = (
+                total_waiting_time / len(summary.waiting_times)
+                if summary.waiting_times
+                else 0.0
+            )
+            max_waiting_time = max(summary.waiting_times) if summary.waiting_times else 0.0
+            seconds_since_last_new_bus = (
+                current_time - last_new_bus_time if last_new_bus_time is not None else None
+            )
+            seconds_since_last_out_bus = (
+                current_time - last_out_bus_time if last_out_bus_time is not None else None
+            )
 
-        rows.append(
-            {
-                "frame_index": frame_index,
-                "source_frame": image_path.name,
-                "time_second": round(current_time, 3),
-                "time_hhmmss": seconds_to_hhmmss(current_time),
-                "bus_count_inside": summary.count,
-                "bus_count_diff": summary.count - previous_count,
-                "bus_ids_inside": ";".join(str(track_id) for track_id in summary.ids),
-                "raw_tracker_ids_inside": ";".join(str(track_id) for track_id in summary.raw_ids),
-                "new_bus_count": len(summary.new_ids),
-                "new_bus_ids": ";".join(str(track_id) for track_id in summary.new_ids),
-                "gate_in_event_count": len(summary.gate_in_ids),
-                "gate_in_event_ids": ";".join(str(track_id) for track_id in summary.gate_in_ids),
-                "exited_bus_count": (
-                    round(seconds_since_last_out_bus, 3)
-                    if seconds_since_last_out_bus is not None
-                    else ""
-                ),
-                "exited_bus_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
-                "gate_out_event_count": len(summary.gate_out_ids),
-                "gate_out_event_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
-                "tracker_exited_bus_count": len(summary.exited_ids),
-                "tracker_exited_bus_ids": ";".join(str(track_id) for track_id in summary.exited_ids),
-                "recovered_bus_count": len(summary.recovered_ids),
-                "recovered_bus_ids": ";".join(str(track_id) for track_id in summary.recovered_ids),
-                "raw_id_switch_count": summary.raw_id_switches,
-                "avg_area": round(avg_area, 3),
-                "avg_area_diff": round(avg_area - previous_avg_area, 3),
-                "max_area": round(max_area, 3),
-                "remaining_time": round(total_waiting_time, 3),
-                "total_waiting_time": round(total_waiting_time, 3),
-                "avg_waiting_time": round(avg_waiting_time, 3),
-                "max_waiting_time": round(max_waiting_time, 3),
-                "seconds_since_last_new_bus": (
-                    round(seconds_since_last_new_bus, 3)
-                    if seconds_since_last_new_bus is not None
-                    else ""
-                ),
-                "seconds_since_last_out_bus": (
-                    round(seconds_since_last_out_bus, 3)
-                    if seconds_since_last_out_bus is not None
-                    else ""
-                ),
-            }
-        )
+            rows.append(
+                {
+                    "frame_index": frame_index,
+                    "source_frame": image_path.name,
+                    "time_second": round(current_time, 3),
+                    "time_hhmmss": seconds_to_hhmmss(current_time),
+                    "bus_count_inside": summary.count,
+                    "bus_count_diff": summary.count - previous_count,
+                    "bus_ids_inside": ";".join(str(track_id) for track_id in summary.ids),
+                    "raw_tracker_ids_inside": ";".join(str(track_id) for track_id in summary.raw_ids),
+                    "new_bus_count": len(summary.new_ids),
+                    "new_bus_ids": ";".join(str(track_id) for track_id in summary.new_ids),
+                    "gate_in_event_count": len(summary.gate_in_ids),
+                    "gate_in_event_ids": ";".join(str(track_id) for track_id in summary.gate_in_ids),
+                    "exited_bus_count": (
+                        round(seconds_since_last_out_bus, 3)
+                        if seconds_since_last_out_bus is not None
+                        else ""
+                    ),
+                    "exited_bus_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
+                    "gate_out_event_count": len(summary.gate_out_ids),
+                    "gate_out_event_ids": ";".join(str(track_id) for track_id in summary.gate_out_ids),
+                    "tracker_exited_bus_count": len(summary.exited_ids),
+                    "tracker_exited_bus_ids": ";".join(str(track_id) for track_id in summary.exited_ids),
+                    "recovered_bus_count": len(summary.recovered_ids),
+                    "recovered_bus_ids": ";".join(str(track_id) for track_id in summary.recovered_ids),
+                    "raw_id_switch_count": summary.raw_id_switches,
+                    "avg_area": round(avg_area, 3),
+                    "avg_area_diff": round(avg_area - previous_avg_area, 3),
+                    "max_area": round(max_area, 3),
+                    "remaining_time": round(total_waiting_time, 3),
+                    "total_waiting_time": round(total_waiting_time, 3),
+                    "avg_waiting_time": round(avg_waiting_time, 3),
+                    "max_waiting_time": round(max_waiting_time, 3),
+                    "seconds_since_last_new_bus": (
+                        round(seconds_since_last_new_bus, 3)
+                        if seconds_since_last_new_bus is not None
+                        else ""
+                    ),
+                    "seconds_since_last_out_bus": (
+                        round(seconds_since_last_out_bus, 3)
+                        if seconds_since_last_out_bus is not None
+                        else ""
+                    ),
+                }
+            )
 
-        previous_count = summary.count
-        previous_avg_area = avg_area
+            if debug_preview.enabled:
+                debug_frame = render_debug_preview(
+                    image=image,
+                    logical_tracks=logical_tracks,
+                    summary=summary,
+                    gates=active_gate_rois,
+                    frame_index=frame_index,
+                    current_time=current_time,
+                    max_missing_frames=args.max_missing_frames,
+                    seconds_since_last_new_bus=seconds_since_last_new_bus,
+                    seconds_since_last_out_bus=seconds_since_last_out_bus,
+                )
+                write_debug_preview_frame(
+                    debug_preview=debug_preview,
+                    frame=debug_frame,
+                    source_name=image_path.name,
+                )
+
+            previous_count = summary.count
+            previous_avg_area = avg_area
+    finally:
+        release_debug_preview_writer(debug_preview)
 
     write_csv(rows, output_csv)
     log(f"Saved {len(rows)} rows to {output_csv}")
+    if debug_preview.enabled:
+        log(f"Saved debug preview video to {debug_preview.video_path}")
+        if debug_preview.save_frames:
+            log(f"Saved debug preview frames to {debug_preview.output_dir / 'frames'}")
 
 
 if __name__ == "__main__":
