@@ -221,6 +221,13 @@ Train both RandomForest models:
   --model-output ".\models\departure_random_forest.joblib"
 ```
 
+If you do not pass `--training-dir`, the trainer now looks in both:
+
+```text
+outputs/training
+outputs/training_auto
+```
+
 The model bundle contains:
 
 - `RandomForestRegressor`: predicts how many seconds remain until departure.
@@ -245,6 +252,60 @@ Or choose a CSV directly:
 The output includes the regressor's predicted seconds and the classifier's
 bucket probabilities. If no trained model exists, the predictor falls back to
 the older CSV-history method.
+
+By default, the predictor now also writes a progressive cumulative table that
+simulates:
+
+```text
+1 row seen -> probability
+2 rows seen -> probability
+3 rows seen -> probability
+...
+```
+
+That file is saved as:
+
+```text
+outputs/<input>_departure_progressive.csv
+```
+
+If you want only the final latest-row probability table:
+
+```powershell
+.\.venv\Scripts\python.exe .\bus_departure_predictor.py `
+  --csv ".\outputs\bus_vehicle_counts.csv" `
+  --skip-progressive
+```
+
+## Realtime-Learning Simulation
+
+Use this script when you want to replay a full feature CSV as if rows were
+arriving one by one in realtime.
+
+It does three things in one run:
+
+1. predicts on cumulative prefixes (`1 row`, `2 rows`, `3 rows`, ...)
+2. treats `gate_out_event_count` as an automatic departure label
+3. retrains a separate realtime model when enough new gate-out events accumulate
+
+Example:
+
+```powershell
+.\.venv\Scripts\python.exe .\realtime_departure_learning.py `
+  --csv ".\outputs\20260519_133357_vehicle_counts.csv"
+```
+
+Default outputs:
+
+```text
+outputs/<input>_realtime_progressive.csv
+outputs/<input>_realtime_probability.csv
+outputs/training_auto/<input>_gate_out_training.csv
+models/realtime_departure_random_forest.joblib
+models/realtime_departure_random_forest.retrain_state.json
+```
+
+The default auto-retrain threshold is `15` new gate-out departure events.
 
 ## Main CSV Columns
 

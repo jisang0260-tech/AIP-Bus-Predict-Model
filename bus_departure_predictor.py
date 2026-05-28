@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -543,6 +544,88 @@ def write_prediction(prediction: Prediction, output_csv: Path) -> None:
     )
 
 
+def bucket_label_to_column(label: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", label.strip().lower()).strip("_")
+    return f"prob_{normalized or 'bucket'}"
+
+
+def summarize_prediction_row(
+    prediction: Prediction,
+    prefix_rows: int | None = None,
+    current_row_index: int | None = None,
+) -> dict[str, object]:
+    best_bucket = max(prediction.buckets, key=lambda row: float(row["probability"]))
+    predicted_eta = prediction.current_time_second + prediction.expected_departure_in_sec
+    resolved_row_index = prediction.row_index if current_row_index is None else current_row_index
+    resolved_prefix_rows = (prediction.row_index + 1) if prefix_rows is None else prefix_rows
+    row: dict[str, object] = {
+        "prefix_rows": resolved_prefix_rows,
+        "current_row_index": resolved_row_index,
+        "current_time_second": round(prediction.current_time_second, 3),
+        "current_time_hhmmss": seconds_to_hhmmss(prediction.current_time_second),
+        "prediction_method": prediction.method,
+        "expected_departure_in_sec": round(prediction.expected_departure_in_sec, 3),
+        "predicted_departure_hhmmss": seconds_to_hhmmss(predicted_eta),
+        "top_bucket": best_bucket["bucket"],
+        "top_bucket_probability": float(best_bucket["probability"]),
+        "top_bucket_probability_percent": float(best_bucket["probability_percent"]),
+    }
+    for bucket_row in prediction.buckets:
+        row[bucket_label_to_column(str(bucket_row["bucket"]))] = float(bucket_row["probability"])
+    return row
+
+
+def build_prefix_dataframe(raw_df: pd.DataFrame, row_index: int) -> pd.DataFrame:
+    prefix_raw = raw_df.iloc[: row_index + 1].reset_index(drop=True)
+    return add_departure_targets(normalize_schema(prefix_raw))
+
+
+def predict_progressive_rows(
+    raw_df: pd.DataFrame,
+    use_model: bool,
+    model_path: Path,
+    bins: list[ProbabilityBucket],
+    min_samples: int,
+    neighbors: int,
+    default_interval_sec: float,
+    progress_every: int = 100,
+) -> pd.DataFrame:
+    bundle: dict[str, object] | None = None
+    if use_model:
+        bundle = load_model_bundle(model_path)
+
+    rows: list[dict[str, object]] = []
+    for row_index in range(len(raw_df)):
+        if progress_every > 0 and (row_index == 0 or (row_index + 1) % progress_every == 0):
+            log(f"Progressive prediction {row_index + 1}/{len(raw_df)}")
+
+        df_prefix = build_prefix_dataframe(raw_df, row_index)
+        prefix_row_index = len(df_prefix) - 1
+        if bundle is not None:
+            prediction = predict_departure_with_model(
+                df=df_prefix,
+                row_index=prefix_row_index,
+                bundle=bundle,
+            )
+        else:
+            prediction = predict_departure(
+                df=df_prefix,
+                row_index=prefix_row_index,
+                buckets=bins,
+                min_samples=min_samples,
+                neighbors=neighbors,
+                default_interval_sec=default_interval_sec,
+            )
+        rows.append(summarize_prediction_row(prediction))
+
+    return pd.DataFrame(rows)
+
+
+def write_progressive_predictions(rows: pd.DataFrame, output_csv: Path) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    rows.to_csv(output_csv, index=False, quoting=csv.QUOTE_MINIMAL)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -556,6 +639,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=Path,
         help="Prediction CSV path. Defaults to outputs/<input>_departure_probability.csv.",
+    )
+    parser.add_argument(
+        "--progressive-output-csv",
+        default=None,
+        type=Path,
+        help=(
+            "Progressive cumulative prediction CSV path. Defaults to "
+            "outputs/<input>_departure_progressive.csv."
+        ),
     )
     parser.add_argument(
         "--row-index",
@@ -578,6 +670,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-samples", default=12, type=int)
     parser.add_argument("--neighbors", default=40, type=int)
     parser.add_argument("--default-interval-sec", default=300.0, type=float)
+    parser.add_argument(
+        "--skip-progressive",
+        action="store_true",
+        help="Skip cumulative one-row, two-row, three-row progressive prediction output.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        default=100,
+        type=int,
+        help="Print progressive simulation progress every N rows.",
+    )
     return parser
 
 
@@ -612,29 +715,52 @@ def main() -> None:
     if not 0 <= row_index < len(df):
         raise IndexError(f"--row-index is out of range for {len(df)} rows")
 
+    prefix_df = build_prefix_dataframe(raw_df, row_index)
+    prefix_row_index = len(prefix_df) - 1
+
     output_csv = (
         args.output_csv
         if args.output_csv is not None
         else DEFAULT_OUTPUT_DIR / f"{input_csv.stem}_departure_probability.csv"
     )
+    progressive_output_csv = (
+        args.progressive_output_csv
+        if args.progressive_output_csv is not None
+        else DEFAULT_OUTPUT_DIR / f"{input_csv.stem}_departure_progressive.csv"
+    )
 
     if not args.no_model and args.model.exists():
         bundle = load_model_bundle(args.model)
         prediction = predict_departure_with_model(
-            df=df,
-            row_index=row_index,
+            df=prefix_df,
+            row_index=prefix_row_index,
             bundle=bundle,
         )
+        use_model = True
     else:
         prediction = predict_departure(
-            df=df,
-            row_index=row_index,
+            df=prefix_df,
+            row_index=prefix_row_index,
             buckets=args.bins,
             min_samples=args.min_samples,
             neighbors=args.neighbors,
             default_interval_sec=args.default_interval_sec,
         )
+        use_model = False
     write_prediction(prediction, output_csv)
+
+    if not args.skip_progressive:
+        progressive_rows = predict_progressive_rows(
+            raw_df=raw_df,
+            use_model=use_model,
+            model_path=args.model,
+            bins=args.bins,
+            min_samples=args.min_samples,
+            neighbors=args.neighbors,
+            default_interval_sec=args.default_interval_sec,
+            progress_every=args.progress_every,
+        )
+        write_progressive_predictions(progressive_rows, progressive_output_csv)
 
     best_bucket = max(prediction.buckets, key=lambda row: float(row["probability"]))
     expected_eta = prediction.current_time_second + prediction.expected_departure_in_sec
@@ -655,6 +781,8 @@ def main() -> None:
         f"around {seconds_to_hhmmss(expected_eta)}"
     )
     log(f"Saved probability table to {output_csv}")
+    if not args.skip_progressive:
+        log(f"Saved progressive prediction table to {progressive_output_csv}")
 
 
 if __name__ == "__main__":

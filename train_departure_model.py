@@ -22,18 +22,36 @@ from bus_departure_predictor import (
 
 
 DEFAULT_MODEL_PATH = Path("models/departure_random_forest.joblib")
+DEFAULT_MANUAL_TRAINING_DIR = Path("outputs/training")
+DEFAULT_AUTO_TRAINING_DIR = Path("outputs/training_auto")
 
 
 def log(message: str) -> None:
     print(message, flush=True)
 
 
-def collect_training_csvs(training_csv: Path | None, training_dir: Path | None) -> list[Path]:
+def collect_training_csvs(
+    training_csvs: list[Path] | None,
+    training_dirs: list[Path] | None,
+) -> list[Path]:
     paths: list[Path] = []
-    if training_csv is not None:
-        paths.append(training_csv)
-    if training_dir is not None:
-        paths.extend(sorted(training_dir.glob("*.csv")))
+    explicit_csvs = training_csvs or []
+    explicit_dirs = training_dirs or []
+
+    for path in explicit_csvs:
+        if not path.exists():
+            raise FileNotFoundError(f"Training CSV does not exist: {path}")
+        paths.append(path)
+
+    for directory in explicit_dirs:
+        if not directory.exists():
+            raise FileNotFoundError(f"Training directory does not exist: {directory}")
+        paths.extend(sorted(directory.glob("*.csv")))
+
+    if not explicit_csvs and not explicit_dirs:
+        for default_dir in (DEFAULT_MANUAL_TRAINING_DIR, DEFAULT_AUTO_TRAINING_DIR):
+            if default_dir.exists():
+                paths.extend(sorted(default_dir.glob("*.csv")))
 
     unique_paths = []
     seen = set()
@@ -45,11 +63,10 @@ def collect_training_csvs(training_csv: Path | None, training_dir: Path | None) 
         unique_paths.append(path)
 
     if not unique_paths:
-        raise FileNotFoundError("Pass --training-csv or --training-dir with CSV files.")
-
-    missing = [path for path in unique_paths if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"Training CSV does not exist: {missing[0]}")
+        raise FileNotFoundError(
+            "No training CSV files were found. Pass --training-csv / --training-dir "
+            "or place CSVs in outputs/training and outputs/training_auto."
+        )
 
     return unique_paths
 
@@ -220,8 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train RandomForest departure regressor and classifier."
     )
-    parser.add_argument("--training-csv", default=None, type=Path)
-    parser.add_argument("--training-dir", default=None, type=Path)
+    parser.add_argument("--training-csv", action="append", type=Path)
+    parser.add_argument("--training-dir", action="append", type=Path)
     parser.add_argument("--model-output", default=DEFAULT_MODEL_PATH, type=Path)
     parser.add_argument("--bins", default=DEFAULT_BINS)
     parser.add_argument("--n-estimators", default=300, type=int)
@@ -242,11 +259,7 @@ def main() -> None:
         raise ValueError("--validation-fraction must be in [0, 1)")
 
     parse_probability_bins(args.bins)
-    training_dir = args.training_dir
-    if args.training_csv is None and training_dir is None:
-        training_dir = Path("outputs/training")
-
-    training_paths = collect_training_csvs(args.training_csv, training_dir)
+    training_paths = collect_training_csvs(args.training_csv, args.training_dir)
     raw_df = load_training_data(training_paths)
     training_df = prepare_training_data(raw_df)
     train_df, valid_df = split_train_validation(training_df, args.validation_fraction)
